@@ -26,7 +26,7 @@ delta and mainnet are stretch goals.
 - [x] Phase 0: repo, interfaces, CI skeleton
 - [x] Phase 1: PricingEngine
 - [x] Phase 2: Vault + OptionToken (invariant-tested)
-- [ ] Phase 3: Oracle + settlement
+- [x] Phase 3: Oracle + settlement (Automation-driven; upkeep registration is a Phase 5 deploy step)
 - [ ] Phase 4: Security pass
 - [ ] Phase 5: Frontend + deploy
 - [ ] Phase 6: Polish
@@ -67,3 +67,30 @@ Reserved payout backed by WETH balance; options sold <= collateral locked; per-e
 locked collateral; payout per option < 1; reserved payout covers all outstanding options; USDC
 balance covers all claimable premium; share supply conserved. A mutation check (doubling the payout
 formula) confirms the suite fails on a real accounting bug.
+
+## Oracle, settlement and keeper (Phase 3)
+- **Live spot** (`SettlementResolver.spot`): rejects non-positive answers, `answeredInRound < roundId`,
+  future timestamps, and data older than `heartbeat + buffer`. An optional Arbitrum sequencer-uptime
+  feed adds a down / grace-period check (disabled with `address(0)` on testnets).
+- **Settlement price is not a spot read at trigger time.** It is the Chainlink round in effect at
+  expiry: the last round with `updatedAt <= expiry`. Anyone may call `submitExpiryRound(epoch, roundId)`
+  but only that one round is accepted, so the caller has no discretion and nothing in the settlement
+  transaction can move the price. The feed must also have been fresh at expiry, otherwise settlement
+  is refused rather than run on stale data.
+  Exploit tests: post-expiry feed manipulation, cherry-picking an in-epoch spike, and skipping the
+  price record all fail (`test/Stack.t.sol`).
+- **VaultKeeper** is the single keeper for the engine and vault and is driven by one Chainlink
+  Automation upkeep. `checkUpkeep` finds the next due action (settle, record price, begin settlement,
+  activate, start epoch, hourly snapshot); `performUpkeep` is forwarder-only and re-derives the due
+  action, so forged `performData` is rejected.
+- **Vol floor and cap** (`minVolatility` / `maxVolatility`): found while testing. A flat market gives
+  zero realized vol, `strikeForDelta` rejects that, and the keeper would retry `startEpoch` forever
+  (epoch start frozen). Clamping fixes that and stops one price spike from producing an out-of-range
+  strike. Regression tests cover both ends. Raw vol stays available via `rawVolatility()`.
+
+### Known limitations / trust assumptions
+- Trust the Chainlink ETH/USD feed and its heartbeat/deviation configuration.
+- If a Chainlink aggregator phase change falls between the last pre-expiry round and the latest round,
+  `submitExpiryRound` cannot verify the successor and refuses; settlement stalls until resolved.
+- Realized vol is sampled from the same feed, so it inherits the feed's update cadence (a stale
+  answer repeated across samples looks like zero vol; the floor covers that).

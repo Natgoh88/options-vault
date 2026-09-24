@@ -47,7 +47,7 @@ abstract contract VaultBase is Test {
         usdc = new MockERC20("USDC", "USDC", 6);
         resolver = new MockResolver();
         resolver.setPrice(SPOT);
-        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18);
+        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18, 0.3e18, 5e18);
         token = new OptionToken();
         vault = new OptionsVault(
             IERC20(address(weth)),

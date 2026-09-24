@@ -28,6 +28,11 @@ contract PricingEngine is IPricingEngine {
     uint256 public immutable windowSize;
     /// @notice Risk-free rate, annualised, 1e18 (e.g. 0.05e18).
     int256 public immutable riskFreeRate;
+    /// @notice Bounds applied to the realized-vol estimate used for pricing. The floor keeps a flat
+    ///         market (zero realized vol) from making epochs impossible to start or underpricing
+    ///         options; the cap keeps a single price spike from pushing the strike out of range.
+    uint256 public immutable minVolatility;
+    uint256 public immutable maxVolatility;
 
     // ring buffer of log returns
     int256[] internal _returns;
@@ -39,8 +44,18 @@ contract PricingEngine is IPricingEngine {
     uint256 public lastPrice;
     uint256 public lastTimestamp;
 
-    constructor(address keeper_, uint256 sampleInterval_, uint256 windowSize_, int256 riskFree_) {
+    constructor(
+        address keeper_,
+        uint256 sampleInterval_,
+        uint256 windowSize_,
+        int256 riskFree_,
+        uint256 minVol_,
+        uint256 maxVol_
+    ) {
         if (sampleInterval_ == 0 || windowSize_ < 2) revert InvalidInput();
+        if (minVol_ == 0 || maxVol_ <= minVol_) revert InvalidInput();
+        minVolatility = minVol_;
+        maxVolatility = maxVol_;
         keeper = keeper_;
         sampleInterval = sampleInterval_;
         windowSize = windowSize_;
@@ -80,7 +95,16 @@ contract PricingEngine is IPricingEngine {
     }
 
     /// @inheritdoc IPricingEngine
+    /// @dev Raw estimate clamped to [minVolatility, maxVolatility].
     function realizedVolatility() public view returns (uint256) {
+        uint256 v = rawVolatility();
+        if (v < minVolatility) return minVolatility;
+        if (v > maxVolatility) return maxVolatility;
+        return v;
+    }
+
+    /// @notice Unclamped annualised realized volatility (1e18).
+    function rawVolatility() public view returns (uint256) {
         uint256 n = _count;
         if (n < 2) revert InsufficientHistory();
         // sample variance = (sumSq - sum^2 / n) / (n - 1)

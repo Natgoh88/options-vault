@@ -9,7 +9,7 @@ contract PricingEngineTest is Test {
     address keeper = address(0xBEEF);
 
     function setUp() public {
-        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18);
+        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18, 0.3e18, 5e18);
     }
 
     function test_cdfKnownValues() public view {

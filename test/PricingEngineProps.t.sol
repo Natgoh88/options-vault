@@ -12,7 +12,7 @@ contract PricingEngineProps is Test {
     uint256 constant CDF_ERR = 75e9; // A&S 26.2.17 bound, 7.5e-8 in 1e18
 
     function setUp() public {
-        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18);
+        engine = new PricingEngine(keeper, 1 hours, 24, 0.05e18, 0.3e18, 5e18);
     }
 
     // ------------------------------------------------------------------
@@ -179,9 +179,9 @@ contract PricingEngineProps is Test {
 
     function test_constructorRejectsBadParams() public {
         vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
-        new PricingEngine(keeper, 0, 24, 0);
+        new PricingEngine(keeper, 0, 24, 0, 0.3e18, 5e18);
         vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
-        new PricingEngine(keeper, 1 hours, 1, 0);
+        new PricingEngine(keeper, 1 hours, 1, 0, 0.3e18, 5e18);
     }
 
     // ------------------------------------------------------------------
@@ -201,8 +201,8 @@ contract PricingEngineProps is Test {
     /// After the window wraps, vol must equal that of a fresh engine that only saw the last
     /// `window` returns, i.e. evicted samples leave no residue in the accumulators.
     function test_ringBufferWraparoundMatchesFreshWindow() public {
-        PricingEngine a = new PricingEngine(keeper, 1 hours, 4, 0.05e18);
-        PricingEngine b = new PricingEngine(keeper, 1 hours, 4, 0.05e18);
+        PricingEngine a = new PricingEngine(keeper, 1 hours, 4, 0.05e18, 0.3e18, 5e18);
+        PricingEngine b = new PricingEngine(keeper, 1 hours, 4, 0.05e18, 0.3e18, 5e18);
         uint256[11] memory raw =
             [uint256(2000), 2300, 1700, 2600, 1500, 2000, 2020, 1990, 2040, 2010, 2050];
         uint256[] memory all = new uint256[](11);
@@ -216,15 +216,15 @@ contract PricingEngineProps is Test {
         }
         _feed(b, tail);
         assertEq(a.sampleCount(), 4);
-        assertApproxEqRel(a.realizedVolatility(), b.realizedVolatility(), 1e10);
+        assertApproxEqRel(a.rawVolatility(), b.rawVolatility(), 1e10);
     }
 
     /// Accumulator drift: after many wraps, still matches a fresh engine on the last window.
     function testFuzz_accumulatorNoDrift(uint256 seed) public {
         uint256 w = 8;
         uint256 n = 60;
-        PricingEngine a = new PricingEngine(keeper, 1 hours, w, 0.05e18);
-        PricingEngine b = new PricingEngine(keeper, 1 hours, w, 0.05e18);
+        PricingEngine a = new PricingEngine(keeper, 1 hours, w, 0.05e18, 0.3e18, 5e18);
+        PricingEngine b = new PricingEngine(keeper, 1 hours, w, 0.05e18, 0.3e18, 5e18);
         uint256[] memory prices = new uint256[](n);
         uint256 px = 2000e18;
         for (uint256 i; i < n; ++i) {
@@ -238,6 +238,43 @@ contract PricingEngineProps is Test {
             tail[i] = prices[n - (w + 1) + i];
         }
         _feed(b, tail);
-        assertApproxEqRel(a.realizedVolatility(), b.realizedVolatility(), 1e11);
+        assertApproxEqRel(a.rawVolatility(), b.rawVolatility(), 1e11);
+    }
+
+    // ------------------------------------------------------------------
+    // Volatility clamp (regression: flat market => zero vol froze epoch start)
+    // ------------------------------------------------------------------
+
+    function test_flatMarketVolClampedToFloor() public {
+        vm.startPrank(keeper);
+        for (uint256 i; i < 12; ++i) {
+            engine.recordSnapshot(2000e18); // identical prices => zero returns
+            vm.warp(block.timestamp + 1 hours);
+        }
+        vm.stopPrank();
+        assertEq(engine.rawVolatility(), 0);
+        assertEq(engine.realizedVolatility(), engine.minVolatility());
+        // and the floor keeps strike selection working
+        engine.strikeForDelta(2000e18, engine.realizedVolatility(), 7 days, 0.3e18);
+    }
+
+    function test_spikeVolClampedToCap() public {
+        vm.startPrank(keeper);
+        engine.recordSnapshot(2000e18);
+        vm.warp(block.timestamp + 1 hours);
+        engine.recordSnapshot(4000e18); // +100% in an hour
+        vm.warp(block.timestamp + 1 hours);
+        engine.recordSnapshot(2000e18);
+        vm.stopPrank();
+        assertGt(engine.rawVolatility(), engine.maxVolatility());
+        assertEq(engine.realizedVolatility(), engine.maxVolatility());
+        engine.strikeForDelta(2000e18, engine.realizedVolatility(), 7 days, 0.3e18);
+    }
+
+    function test_constructorRejectsBadVolBounds() public {
+        vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
+        new PricingEngine(keeper, 1 hours, 24, 0, 0, 5e18);
+        vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
+        new PricingEngine(keeper, 1 hours, 24, 0, 1e18, 1e18);
     }
 }
