@@ -25,7 +25,7 @@ delta and mainnet are stretch goals.
 ## Status
 - [x] Phase 0: repo, interfaces, CI skeleton
 - [x] Phase 1: PricingEngine
-- [ ] Phase 2: Vault + OptionToken
+- [x] Phase 2: Vault + OptionToken (invariant-tested)
 - [ ] Phase 3: Oracle + settlement
 - [ ] Phase 4: Security pass
 - [ ] Phase 5: Frontend + deploy
@@ -48,3 +48,22 @@ forge build && forge test
   (e.g. 10-delta at 300% vol and 60 days). Fine for the weekly ~30-delta use case.
 - Reference vectors: `script/gen_vectors.py` writes `test/vectors/bs_vectors.json` (400 cases,
   exact CDF via `math.erfc`, identical to `scipy.stats.norm.cdf`).
+
+## Vault design notes (Phase 2)
+- **Epoch flow:** `startEpoch` (keeper) -> `buyOptions` (anyone, USDC) -> `activate` (permissionless
+  once sold out or the writing window closes) -> `beginSettlement` (after expiry) -> `settle`.
+- **Strike and premium are fixed at `startEpoch`** from spot, realized vol and the 30-delta target,
+  so buyers cannot game them during the writing window. Premium rounds up (favours the vault).
+- **Deposits/withdrawals only in Idle**, so collateral cannot move mid-epoch.
+- **Premium is USDC, share price is WETH.** USDC premium streams to shareholders via a per-share
+  accumulator (settled on every mint/burn/transfer), so it is not mixed into `totalAssets`.
+- **Cash-settled in WETH:** payout per option = (S - K) / S, rounded down. `settle` reserves the
+  total (`reservedPayout`, excluded from `totalAssets`); holders call `redeem` to claim. Payout per
+  option is always < 1 WETH, so payouts can never exceed locked collateral.
+- **Virtual-share offset (3)** on the ERC-4626 to blunt first-depositor inflation attacks.
+
+### Invariants (test/OptionsVault.invariant.t.sol)
+Reserved payout backed by WETH balance; options sold <= collateral locked; per-epoch payouts <=
+locked collateral; payout per option < 1; reserved payout covers all outstanding options; USDC
+balance covers all claimable premium; share supply conserved. A mutation check (doubling the payout
+formula) confirms the suite fails on a real accounting bug.

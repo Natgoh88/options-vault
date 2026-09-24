@@ -2,7 +2,9 @@
 pragma solidity ^0.8.26;
 
 /// @notice ERC-4626 covered-call vault over WETH with weekly epochs.
-/// @dev Inherit IERC4626 in the implementation.
+/// @dev Inherit IERC4626 in the implementation. Deposits/withdrawals are only possible in Idle.
+///      Premium is paid in USDC (6 decimals) and streamed to shareholders via an accumulator;
+///      option payouts are cash-settled in WETH and claimed by holders via `redeem`.
 interface IOptionsVault {
     enum State {
         Idle,
@@ -12,35 +14,69 @@ interface IOptionsVault {
     }
 
     struct Epoch {
-        uint256 strike;
-        uint256 expiry;
-        uint256 collateralLocked;
-        uint256 premiumCollected;
-        uint256 settlementPrice;
+        uint256 strike; // USD per WETH, 1e18
+        uint256 expiry; // unix seconds
+        uint256 writingEnd; // last timestamp options can be bought
+        uint256 collateralLocked; // WETH, max options that can be sold
+        uint256 premiumPerOption; // USDC (6 dec) per 1e18 options
+        uint256 optionsSold; // WETH-denominated notional, 1e18
+        uint256 premiumCollected; // USDC (6 dec)
+        uint256 settlementPrice; // USD per WETH, 1e18
+        uint256 payoutPerOption; // WETH (1e18) per 1e18 options
+        bool settled;
     }
 
     error WrongState(State current);
     error NotKeeper();
+    error WritingClosed();
+    error WritingStillOpen();
+    error ExceedsCollateral();
+    error NothingToLock();
+    error TooEarly();
+    error NotSettled();
+    error ZeroAmount();
 
-    event EpochStarted(uint256 indexed epoch, uint256 strike, uint256 expiry, uint256 collateral);
+    event EpochStarted(
+        uint256 indexed epoch, uint256 strike, uint256 expiry, uint256 collateral, uint256 premium
+    );
     event OptionsPurchased(
         uint256 indexed epoch, address indexed buyer, uint256 amount, uint256 premium
     );
-    event EpochSettled(uint256 indexed epoch, uint256 settlementPrice, uint256 payout);
+    event EpochActivated(uint256 indexed epoch, uint256 optionsSold, uint256 premiumCollected);
+    event SettlementStarted(uint256 indexed epoch, uint256 settlementPrice);
+    event EpochSettled(uint256 indexed epoch, uint256 payoutPerOption, uint256 totalPayout);
+    event OptionsRedeemed(
+        uint256 indexed epoch, address indexed holder, uint256 amount, uint256 payout
+    );
+    event PremiumClaimed(address indexed account, uint256 amount);
 
     function state() external view returns (State);
     function currentEpoch() external view returns (uint256);
     function epochData(uint256 epoch) external view returns (Epoch memory);
 
-    /// @notice Idle -> Writing: pick strike via PricingEngine, lock collateral.
+    /// @notice Idle -> Writing: pick strike via PricingEngine, lock collateral, fix premium.
     function startEpoch() external;
 
-    /// @notice Writing -> Active: buyer pays USDC premium and receives OptionToken.
+    /// @notice Writing: buyer pays USDC premium and receives OptionToken.
     function buyOptions(uint256 amount) external returns (uint256 premium);
+
+    /// @notice Writing -> Active: once sold out or the writing window has closed.
+    function activate() external;
 
     /// @notice Active -> Settling: snapshot settlement price after expiry.
     function beginSettlement() external;
 
-    /// @notice Settling -> Idle: pay ITM holders, release remaining collateral.
+    /// @notice Settling -> Idle: fix payout per option and reserve the WETH for holders.
     function settle() external;
+
+    /// @notice Burn `amount` options of a settled epoch and receive the WETH payout.
+    function redeem(uint256 epoch, uint256 amount) external returns (uint256 payout);
+
+    /// @notice Claim accrued USDC premium.
+    function claimPremium() external returns (uint256 amount);
+
+    function pendingPremium(address account) external view returns (uint256);
+
+    /// @notice WETH reserved for option holders who have not redeemed yet.
+    function reservedPayout() external view returns (uint256);
 }
