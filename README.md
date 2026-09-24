@@ -24,7 +24,7 @@ delta and mainnet are stretch goals.
 
 ## Status
 - [x] Phase 0: repo, interfaces, CI skeleton
-- [ ] Phase 1: PricingEngine
+- [x] Phase 1: PricingEngine
 - [ ] Phase 2: Vault + OptionToken
 - [ ] Phase 3: Oracle + settlement
 - [ ] Phase 4: Security pass
@@ -38,3 +38,13 @@ See the full plan in `docs/action-plan.md`.
 git clone --recurse-submodules <repo>
 forge build && forge test
 ```
+
+## PricingEngine accuracy and limits
+- Normal CDF: Abramowitz & Stegun 26.2.17, absolute error <= 7.5e-8. This propagates to price as
+  roughly (S + K*e^-rT) * 7.5e-8 (about 1.5e-5 at S = 100). Tests derive their tolerances from
+  this bound rather than an arbitrary epsilon.
+- The approximation has a ~1e-9 discontinuity at x = 0 (N(0) is not exactly 0.5); inside the bound.
+- `strikeForDelta` bisects over [S/4, 4S] and reverts if the target delta is not bracketed
+  (e.g. 10-delta at 300% vol and 60 days). Fine for the weekly ~30-delta use case.
+- Reference vectors: `script/gen_vectors.py` writes `test/vectors/bs_vectors.json` (400 cases,
+  exact CDF via `math.erfc`, identical to `scipy.stats.norm.cdf`).
