@@ -176,6 +176,7 @@ contract Deploy is Script {
         vm.serializeUint(k, "idleWindow", p.vault.idleWindow);
         vm.serializeUint(k, "targetDelta", p.vault.targetDelta);
         string memory json = vm.serializeUint(k, "deployBlock", block.number);
+        vm.createDir("./deployments", true); // absent on a fresh clone (git does not track empty dirs)
         vm.writeJson(json, string.concat("./deployments/", vm.toString(block.chainid), ".json"));
     }
 
