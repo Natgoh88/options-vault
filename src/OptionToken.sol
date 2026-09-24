@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {IOptionToken} from "./interfaces/IOptionToken.sol";
@@ -12,6 +12,9 @@ contract OptionToken is ERC1155, IOptionToken {
 
     error VaultAlreadySet();
     error NotDeployer();
+    error ZeroAddress();
+
+    event VaultSet(address indexed vault);
 
     constructor() ERC1155("") {
         deployer = msg.sender;
@@ -21,7 +24,9 @@ contract OptionToken is ERC1155, IOptionToken {
     function setVault(address vault_) external {
         if (msg.sender != deployer) revert NotDeployer();
         if (vault != address(0)) revert VaultAlreadySet();
+        if (vault_ == address(0)) revert ZeroAddress();
         vault = vault_;
+        emit VaultSet(vault_);
     }
 
     function tokenId(uint256 strike, uint256 expiry) public pure returns (uint256) {

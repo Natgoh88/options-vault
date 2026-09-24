@@ -71,6 +71,12 @@ contract MockAggregator is AggregatorV3Interface {
         _push(answer, updatedAt);
     }
 
+    /// Append a round with an explicit id (to model Chainlink phase changes / gaps).
+    function pushWithId(uint80 id, int256 answer, uint256 updatedAt) external {
+        latestId = id;
+        rounds[id] = Round(answer, updatedAt, updatedAt);
+    }
+
     function _push(int256 answer, uint256 updatedAt) internal {
         ++latestId;
         rounds[latestId] = Round(answer, updatedAt, updatedAt);

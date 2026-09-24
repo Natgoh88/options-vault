@@ -41,6 +41,9 @@ abstract contract VaultBase is Test {
     uint256 constant SPOT = 2000e18;
     uint256 constant EPOCH = 7 days;
     uint256 constant WRITING = 1 hours;
+    uint256 constant IDLE = 1 hours;
+    uint256 constant MAX_DEV_BPS = 100; // 1%
+    uint256 constant MARKUP_BPS = 200; // 2%
 
     function _deploy() internal {
         weth = new MockERC20("WETH", "WETH", 18);
@@ -56,9 +59,14 @@ abstract contract VaultBase is Test {
             ISettlementResolver(address(resolver)),
             IOptionToken(address(token)),
             keeper,
-            EPOCH,
-            WRITING,
-            0.3e18
+            OptionsVault.Params({
+                epochDuration: EPOCH,
+                writingWindow: WRITING,
+                idleWindow: IDLE,
+                targetDelta: 0.3e18,
+                maxSpotDeviationBps: MAX_DEV_BPS,
+                premiumMarkupBps: MARKUP_BPS
+            })
         );
         token.setVault(address(vault));
 
@@ -247,7 +255,7 @@ contract OptionsVaultTest is VaultBase {
         _start();
         vm.prank(buyer);
         vm.expectRevert(IOptionsVault.NotSettled.selector);
-        vault.redeem(1, 1e18);
+        vault.redeemOptions(1, 1e18);
     }
 
     function test_optionTokenOnlyVault() public {
@@ -285,7 +293,7 @@ contract OptionsVaultTest is VaultBase {
 
         // buyer's options are worthless; redeem burns for 0
         vm.prank(buyer);
-        uint256 payout = vault.redeem(1, 10e18);
+        uint256 payout = vault.redeemOptions(1, 10e18);
         assertEq(payout, 0);
     }
 
@@ -306,7 +314,7 @@ contract OptionsVaultTest is VaultBase {
         assertEq(vault.totalAssets(), 10e18 - total);
 
         vm.prank(buyer);
-        uint256 payout = vault.redeem(1, 10e18);
+        uint256 payout = vault.redeemOptions(1, 10e18);
         assertEq(payout, total);
         assertEq(weth.balanceOf(buyer), total);
         assertEq(vault.reservedPayout(), 0);
@@ -371,7 +379,7 @@ contract OptionsVaultTest is VaultBase {
         token.safeTransferFrom(buyer, bob, id, 10e18, "");
         _finish(strike * 2);
         vm.prank(bob);
-        uint256 payout = vault.redeem(1, 10e18);
+        uint256 payout = vault.redeemOptions(1, 10e18);
         assertGt(payout, 0);
     }
 

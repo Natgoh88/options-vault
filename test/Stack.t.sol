@@ -38,6 +38,8 @@ abstract contract StackBase is Test {
     uint256 constant GRACE = 1 hours;
     uint256 constant EPOCH = 7 days;
     uint256 constant WRITING = 1 hours;
+    uint256 constant IDLE = 2 hours;
+    uint256 constant FALLBACK = 2 days;
 
     int256 px = 2000e8; // feed decimals = 8
     bool up;
@@ -57,7 +59,8 @@ abstract contract StackBase is Test {
             AggregatorV3Interface(address(sequencer)),
             HEARTBEAT,
             BUFFER,
-            GRACE
+            GRACE,
+            FALLBACK
         );
         token = new OptionToken();
         vault = new OptionsVault(
@@ -67,9 +70,14 @@ abstract contract StackBase is Test {
             ISettlementResolver(address(resolver)),
             IOptionToken(address(token)),
             address(kc),
-            EPOCH,
-            WRITING,
-            0.3e18
+            OptionsVault.Params({
+                epochDuration: EPOCH,
+                writingWindow: WRITING,
+                idleWindow: IDLE,
+                targetDelta: 0.3e18,
+                maxSpotDeviationBps: 100,
+                premiumMarkupBps: 200
+            })
         );
         token.setVault(address(vault));
         resolver.setVault(IOptionsVault(address(vault)));
@@ -401,7 +409,7 @@ contract VaultKeeperTest is StackBase {
         assertEq(resolver.snapshotSettlementPrice(1), done.settlementPrice);
 
         vm.prank(buyer);
-        uint256 payout = vault.redeem(1, 10e18);
+        uint256 payout = vault.redeemOptions(1, 10e18);
         assertEq(payout, 10e18 * done.payoutPerOption / 1e18);
         assertEq(weth.balanceOf(buyer), payout);
     }

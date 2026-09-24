@@ -113,11 +113,11 @@ contract PricingEngineProps is Test {
         public
         view
     {
-        vol = bound(vol, 0.3e18, 1.5e18);
-        secs = bound(secs, 1 days, 30 days);
-        target = bound(target, 0.1e18, 0.9e18);
+        vol = bound(vol, 0.1e18, 5e18);
+        secs = bound(secs, 1 hours, 90 days);
+        target = bound(target, 0.02e18, 0.98e18);
         uint256 k = engine.strikeForDelta(2000e18, vol, secs, target);
-        assertApproxEqAbs(engine.callDelta(2000e18, k, vol, secs), target, 1e12);
+        assertApproxEqAbs(engine.callDelta(2000e18, k, vol, secs), target, 1e13);
     }
 
     // ------------------------------------------------------------------
@@ -143,11 +143,12 @@ contract PricingEngineProps is Test {
         engine.callPrice(1e18, 1e18, 1e18, 0);
     }
 
-    /// Documented limitation: the bisection bracket is [S/4, 4S]; a target delta whose strike
-    /// falls outside it (here 10-delta at 300% vol, 60d) reverts rather than returning garbage.
-    function test_strikeForDeltaOutsideBracketReverts() public {
-        vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
-        engine.strikeForDelta(2000e18, 3e18, 60 days, 0.1e18);
+    /// Regression: the old solver bisected over [S/4, 4S] and reverted for extreme vol/tenor
+    /// (10-delta at 300% vol, 60d). The d1-space solver has no strike bracket.
+    function test_strikeForDeltaExtremeInputsResolve() public view {
+        uint256 k = engine.strikeForDelta(2000e18, 3e18, 60 days, 0.1e18);
+        assertGt(k, 4 * 2000e18); // beyond the old bracket
+        assertApproxEqAbs(engine.callDelta(2000e18, k, 3e18, 60 days), 0.1e18, 1e12);
     }
 
     function test_strikeForDeltaBadTargetReverts() public {

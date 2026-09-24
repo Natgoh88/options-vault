@@ -17,7 +17,9 @@ interface ISettlementResolver {
     error NotDeployer();
     error VaultAlreadySet();
     error VaultNotSet();
+    error ZeroAddress();
 
+    event VaultSet(address indexed vault);
     event SettlementPriceSet(uint256 indexed epoch, uint256 price, uint80 roundId);
 
     /// @notice Latest checked spot price (1e18). Reverts if stale, non-positive, or the L2

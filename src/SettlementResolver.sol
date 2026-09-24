@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {ISettlementResolver} from "./interfaces/ISettlementResolver.sol";
@@ -12,6 +12,10 @@ import {IOptionsVault} from "./interfaces/IOptionsVault.sol";
 ///      2. Settlement   - the price in effect at expiry, i.e. the LAST round with
 ///         updatedAt <= expiry. It is chosen by rule, not by the caller, and is not a spot read in
 ///         the trigger transaction, so nothing in the settlement transaction can move it.
+///
+///      Liveness: if the feed was stale at expiry (an outage), normal settlement refuses. After
+///      `fallbackDelay` the same deterministic rule is accepted without the freshness requirement,
+///      so an oracle outage can delay settlement but cannot lock collateral forever.
 contract SettlementResolver is ISettlementResolver {
     AggregatorV3Interface public immutable feed;
     /// @notice Optional L2 sequencer uptime feed (address(0) disables the check, e.g. testnets).
@@ -19,6 +23,8 @@ contract SettlementResolver is ISettlementResolver {
     uint256 public immutable heartbeat;
     uint256 public immutable buffer;
     uint256 public immutable sequencerGracePeriod;
+    /// @notice Time after expiry after which a stale-at-expiry round is accepted.
+    uint256 public immutable fallbackDelay;
     uint8 internal immutable _feedDecimals;
 
     address public immutable deployer;
@@ -32,8 +38,10 @@ contract SettlementResolver is ISettlementResolver {
         AggregatorV3Interface sequencerFeed_,
         uint256 heartbeat_,
         uint256 buffer_,
-        uint256 sequencerGracePeriod_
+        uint256 sequencerGracePeriod_,
+        uint256 fallbackDelay_
     ) {
+        if (address(feed_) == address(0)) revert ZeroAddress();
         uint8 d = feed_.decimals();
         if (d > 18) revert InvalidPrice();
         feed = feed_;
@@ -41,6 +49,7 @@ contract SettlementResolver is ISettlementResolver {
         heartbeat = heartbeat_;
         buffer = buffer_;
         sequencerGracePeriod = sequencerGracePeriod_;
+        fallbackDelay = fallbackDelay_;
         _feedDecimals = d;
         deployer = msg.sender;
     }
@@ -49,7 +58,9 @@ contract SettlementResolver is ISettlementResolver {
     function setVault(IOptionsVault vault_) external {
         if (msg.sender != deployer) revert NotDeployer();
         if (address(vault) != address(0)) revert VaultAlreadySet();
+        if (address(vault_) == address(0)) revert ZeroAddress();
         vault = vault_;
+        emit VaultSet(address(vault_));
     }
 
     // ------------------------------------------------------------------
@@ -71,6 +82,8 @@ contract SettlementResolver is ISettlementResolver {
     function _checkSequencer() internal view {
         if (address(sequencerFeed) == address(0)) return;
         (, int256 answer, uint256 startedAt,,) = sequencerFeed.latestRoundData();
+        // Chainlink: startedAt == 0 means the round is invalid
+        if (startedAt == 0 || startedAt > block.timestamp) revert InvalidPrice();
         // answer: 0 = up, 1 = down
         if (answer != 0) revert SequencerDown();
         if (block.timestamp - startedAt <= sequencerGracePeriod) revert GracePeriodNotOver();
@@ -93,16 +106,21 @@ contract SettlementResolver is ISettlementResolver {
         if (updatedAt == 0) revert InvalidRound();
         if (updatedAt > expiry) revert RoundAfterExpiry();
         if (answer <= 0) revert InvalidPrice();
-        // the feed must have been fresh at expiry, otherwise refuse rather than settle on stale data
+
+        // The feed must have been fresh at expiry, otherwise refuse rather than settle on stale
+        // data, unless the fallback delay has passed (outage: better a late deterministic price
+        // than collateral locked forever).
         uint256 maxAge = heartbeat + buffer;
-        if (expiry - updatedAt > maxAge) revert StalePrice(updatedAt, maxAge);
+        if (expiry - updatedAt > maxAge && block.timestamp < expiry + fallbackDelay) {
+            revert StalePrice(updatedAt, maxAge);
+        }
 
         // roundId must be the LAST round at or before expiry
-        (, uint256 nextUpdatedAt) = _round(roundId + 1);
+        uint256 nextUpdatedAt = _successorUpdatedAt(roundId);
         if (nextUpdatedAt != 0) {
             if (nextUpdatedAt <= expiry) revert NotLastRoundBeforeExpiry();
         } else {
-            // no successor: only valid if this really is the newest round (not a phase gap)
+            // no successor: only valid if this really is the newest round
             (uint80 latestId,,,,) = feed.latestRoundData();
             if (latestId != roundId) revert NotLastRoundBeforeExpiry();
         }
@@ -127,6 +145,18 @@ contract SettlementResolver is ISettlementResolver {
     }
 
     // ------------------------------------------------------------------
+
+    /// @dev updatedAt of the round after `roundId`, or 0 if none. Chainlink proxy round ids are
+    ///      (phaseId << 64) | aggregatorRound, so the successor is either roundId + 1 or, across a
+    ///      phase change, the first round of the next phase.
+    function _successorUpdatedAt(uint80 roundId) internal view returns (uint256) {
+        (, uint256 u) = _round(roundId + 1);
+        if (u != 0) return u;
+        uint256 nextPhaseFirst = (((uint256(roundId) >> 64) + 1) << 64) | 1;
+        if (nextPhaseFirst > type(uint80).max) return 0;
+        (, u) = _round(uint80(nextPhaseFirst));
+        return u;
+    }
 
     function _round(uint80 roundId) internal view returns (int256 answer, uint256 updatedAt) {
         try feed.getRoundData(roundId) returns (uint80, int256 a, uint256, uint256 u, uint80) {

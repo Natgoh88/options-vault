@@ -70,6 +70,8 @@ contract VaultHandler is Test {
     function startEpoch(uint256 spot) external {
         if (_state() != IOptionsVault.State.Idle) return;
         if (d.vault.totalAssets() == 0 || d.vault.totalSupply() == 0) return;
+        uint256 open = d.vault.idleSince() + d.vault.idleWindow();
+        if (block.timestamp < open) vm.warp(open);
         d.resolver.setPrice(bound(spot, 1000e18, 4000e18));
         vm.prank(d.keeper);
         try d.vault.startEpoch() {
@@ -124,7 +126,7 @@ contract VaultHandler is Test {
         uint256 amt = bal * bound(pct, 1, 100) / 100;
         if (amt == 0) return;
         vm.prank(a);
-        paidOut[epoch] += d.vault.redeem(epoch, amt);
+        paidOut[epoch] += d.vault.redeemOptions(epoch, amt);
     }
 
     function claimPremium(uint256 seed) external {

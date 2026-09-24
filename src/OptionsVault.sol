@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
@@ -18,13 +19,16 @@ import {ISettlementResolver} from "./interfaces/ISettlementResolver.sol";
 /// @title OptionsVault
 /// @notice ERC-4626 WETH vault that writes weekly covered calls priced on-chain.
 /// @dev Epoch state machine: Idle -> Writing -> Active -> Settling -> Idle.
-///      Deposits/withdrawals are only enabled in Idle so collateral cannot move mid-epoch.
+///      Deposits/withdrawals are only enabled in Idle so collateral cannot move mid-epoch, and Idle
+///      lasts at least `idleWindow` so depositors always have a real exit window.
 ///      Rounding always favours the vault: premium rounds up, payouts round down.
-contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
+contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
     using SafeERC20 for IERC20;
 
     uint256 internal constant PREMIUM_SCALE = 1e30;
     uint256 internal constant USDC_SCALE = 1e12; // 1e18 USD -> 6-decimals USDC
+    uint256 internal constant BPS = 10_000;
+    uint256 internal constant MAX_MARKUP_BPS = 5_000;
 
     IPricingEngine public immutable engine;
     ISettlementResolver public immutable resolver;
@@ -32,12 +36,18 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
     IERC20 public immutable usdc;
     uint256 public immutable epochDuration;
     uint256 public immutable writingWindow;
+    uint256 public immutable idleWindow;
     uint256 public immutable targetDelta; // 1e18, e.g. 0.3e18
+    /// @notice Max |spot_now - spot_at_start| / spot_at_start allowed while options are on sale.
+    uint256 public immutable maxSpotDeviationBps;
+    /// @notice Safety margin over the Black-Scholes price, covering model error and adverse selection.
+    uint256 public immutable premiumMarkupBps;
 
     address public keeper;
 
     State public state;
     uint256 public currentEpoch;
+    uint256 public idleSince;
     uint256 public reservedPayout;
     mapping(uint256 => Epoch) internal _epochs;
 
@@ -58,6 +68,15 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
         _;
     }
 
+    struct Params {
+        uint256 epochDuration;
+        uint256 writingWindow;
+        uint256 idleWindow;
+        uint256 targetDelta;
+        uint256 maxSpotDeviationBps;
+        uint256 premiumMarkupBps;
+    }
+
     constructor(
         IERC20 weth,
         IERC20 usdc_,
@@ -65,25 +84,36 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
         ISettlementResolver resolver_,
         IOptionToken optionToken_,
         address keeper_,
-        uint256 epochDuration_,
-        uint256 writingWindow_,
-        uint256 targetDelta_
+        Params memory p
     ) ERC20("Options Vault WETH", "ovWETH") ERC4626(weth) Ownable(msg.sender) {
-        require(IERC20Metadata(address(usdc_)).decimals() == 6, "USDC decimals");
-        require(targetDelta_ > 0 && targetDelta_ < 1e18, "delta");
-        require(epochDuration_ > 0 && writingWindow_ < epochDuration_, "durations");
+        if (
+            address(weth) == address(0) || address(usdc_) == address(0)
+                || address(engine_) == address(0) || address(resolver_) == address(0)
+                || address(optionToken_) == address(0) || keeper_ == address(0)
+        ) revert ZeroAddress();
+        if (IERC20Metadata(address(usdc_)).decimals() != 6) revert InvalidParams();
+        if (p.targetDelta == 0 || p.targetDelta >= 1e18) revert InvalidParams();
+        if (p.epochDuration == 0 || p.writingWindow >= p.epochDuration) revert InvalidParams();
+        if (p.maxSpotDeviationBps == 0 || p.maxSpotDeviationBps > BPS) revert InvalidParams();
+        if (p.premiumMarkupBps > MAX_MARKUP_BPS) revert InvalidParams();
+
         usdc = usdc_;
         engine = engine_;
         resolver = resolver_;
         optionToken = optionToken_;
         keeper = keeper_;
-        epochDuration = epochDuration_;
-        writingWindow = writingWindow_;
-        targetDelta = targetDelta_;
+        epochDuration = p.epochDuration;
+        writingWindow = p.writingWindow;
+        idleWindow = p.idleWindow;
+        targetDelta = p.targetDelta;
+        maxSpotDeviationBps = p.maxSpotDeviationBps;
+        premiumMarkupBps = p.premiumMarkupBps;
+        idleSince = block.timestamp;
         emit KeeperSet(keeper_);
     }
 
     function setKeeper(address keeper_) external onlyOwner {
+        if (keeper_ == address(0)) revert ZeroAddress();
         keeper = keeper_;
         emit KeeperSet(keeper_);
     }
@@ -124,20 +154,24 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
 
     /// @inheritdoc IOptionsVault
     function startEpoch() external onlyKeeper inState(State.Idle) {
+        if (block.timestamp < idleSince + idleWindow) revert TooEarly();
         uint256 locked = totalAssets();
         if (locked == 0 || totalSupply() == 0) revert NothingToLock();
 
         uint256 spot = resolver.spot();
         uint256 vol = engine.realizedVolatility();
         uint256 strike = engine.strikeForDelta(spot, vol, epochDuration, targetDelta);
-        uint256 premiumUsd = engine.callPrice(spot, strike, vol, epochDuration);
+        uint256 fair = engine.callPrice(spot, strike, vol, epochDuration);
+        uint256 premiumUsd = Math.mulDiv(fair, BPS + premiumMarkupBps, BPS, Math.Rounding.Ceil);
         uint256 premiumUsdc = Math.ceilDiv(premiumUsd, USDC_SCALE); // round up: favours vault
+        if (premiumUsdc == 0) revert ZeroPremium(); // never give options away
 
         uint256 id = ++currentEpoch;
         Epoch storage e = _epochs[id];
         e.strike = strike;
         e.expiry = block.timestamp + epochDuration;
         e.writingEnd = block.timestamp + writingWindow;
+        e.spotAtStart = spot;
         e.collateralLocked = locked;
         e.premiumPerOption = premiumUsdc;
         state = State.Writing;
@@ -156,6 +190,7 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
         Epoch storage e = _epochs[currentEpoch];
         if (block.timestamp > e.writingEnd) revert WritingClosed();
         if (e.optionsSold + amount > e.collateralLocked) revert ExceedsCollateral();
+        _checkSpotDeviation(e.spotAtStart);
 
         premium = Math.mulDiv(amount, e.premiumPerOption, 1e18, Math.Rounding.Ceil);
         e.optionsSold += amount;
@@ -166,11 +201,29 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
         emit OptionsPurchased(currentEpoch, msg.sender, amount, premium);
     }
 
+    /// @dev The premium and strike are fixed at epoch start. If spot has since moved, a buyer could
+    ///      pick off a stale quote, so selling pauses until spot is back inside the band.
+    function _checkSpotDeviation(uint256 spotAtStart) internal view {
+        uint256 spotNow = resolver.spot();
+        uint256 diff = spotNow > spotAtStart ? spotNow - spotAtStart : spotAtStart - spotNow;
+        if (diff * BPS > spotAtStart * maxSpotDeviationBps) {
+            revert SpotMoved(spotAtStart, spotNow);
+        }
+    }
+
     /// @inheritdoc IOptionsVault
     function activate() external inState(State.Writing) {
         Epoch storage e = _epochs[currentEpoch];
         if (e.optionsSold < e.collateralLocked && block.timestamp <= e.writingEnd) {
             revert WritingStillOpen();
+        }
+        if (e.optionsSold == 0) {
+            // Nothing sold: do not lock depositors for a week. Skip straight back to Idle.
+            e.settled = true;
+            state = State.Idle;
+            idleSince = block.timestamp;
+            emit EpochSkipped(currentEpoch);
+            return;
         }
         state = State.Active;
         if (e.premiumCollected > 0) {
@@ -199,13 +252,13 @@ contract OptionsVault is ERC4626, Ownable, ReentrancyGuard, IOptionsVault {
         e.settled = true;
         reservedPayout += total;
         state = State.Idle;
+        idleSince = block.timestamp;
         emit EpochSettled(currentEpoch, ppo, total);
     }
 
     /// @inheritdoc IOptionsVault
-    function redeem(uint256 epoch, uint256 amount)
+    function redeemOptions(uint256 epoch, uint256 amount)
         external
-        override(IOptionsVault)
         nonReentrant
         returns (uint256 payout)
     {

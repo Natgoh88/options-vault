@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {SD59x18, sd, unwrap, exp, ln, sqrt} from "@prb/math/src/SD59x18.sol";
 import {IPricingEngine} from "./interfaces/IPricingEngine.sol";
 
 /// @title PricingEngine
-/// @notice Realized-volatility tracker (O(1) accumulators over a ring buffer of log returns) and
-///         fixed-point Black-Scholes call pricer. Holds no funds.
+/// @notice Realized-volatility tracker (O(1) accumulators over a ring buffer) and fixed-point
+///         Black-Scholes call pricer. Holds no funds.
 /// @dev Normal CDF uses the Abramowitz & Stegun 26.2.17 rational approximation, absolute error
 ///      bounded by 7.5e-8. All values are 1e18 fixed-point.
+///
+///      Volatility estimator: zero-mean realized variance rate,
+///          sigma^2 = sum(r_i^2) / sum(dt_i)   (per year)
+///      where r_i is the log return over a snapshot gap of dt_i seconds. Weighting by the actual
+///      gap (instead of assuming a fixed interval) means a delayed snapshot does not inflate vol:
+///      a 1% move over 24h counts for far less than a 1% move over 1h.
 contract PricingEngine is IPricingEngine {
     uint256 internal constant SECONDS_PER_YEAR = 365 days;
-    uint256 internal constant MAX_SEARCH_ITERS = 60;
+    uint256 internal constant DELTA_SEARCH_ITERS = 48;
+    int256 internal constant D_BOUND = 8e18; // N(-8) ~ 6e-16, N(8) ~ 1 - 6e-16
 
     // A&S 26.2.17 constants (1e18)
     int256 internal constant AS_P = 0.2316419e18;
@@ -23,23 +30,24 @@ contract PricingEngine is IPricingEngine {
     int256 internal constant INV_SQRT_2PI = 0.398942280401432678e18;
 
     address public immutable keeper;
-    /// @notice Minimum seconds between snapshots; also the sampling period used to annualise.
+    /// @notice Minimum seconds between snapshots.
     uint256 public immutable sampleInterval;
     uint256 public immutable windowSize;
     /// @notice Risk-free rate, annualised, 1e18 (e.g. 0.05e18).
     int256 public immutable riskFreeRate;
     /// @notice Bounds applied to the realized-vol estimate used for pricing. The floor keeps a flat
     ///         market (zero realized vol) from making epochs impossible to start or underpricing
-    ///         options; the cap keeps a single price spike from pushing the strike out of range.
+    ///         options; the cap keeps a single price spike from producing an absurd strike.
     uint256 public immutable minVolatility;
     uint256 public immutable maxVolatility;
 
-    // ring buffer of log returns
-    int256[] internal _returns;
+    // ring buffers of squared log returns and their time gaps
+    uint256[] internal _sqReturns;
+    uint256[] internal _gaps;
     uint256 internal _head; // next write slot
     uint256 internal _count; // samples in window
-    int256 internal _sum; // sum of returns
-    uint256 internal _sumSq; // sum of squared returns
+    uint256 internal _sumSq; // sum of squared returns (1e18)
+    uint256 internal _sumGap; // sum of gaps (seconds)
 
     uint256 public lastPrice;
     uint256 public lastTimestamp;
@@ -52,15 +60,17 @@ contract PricingEngine is IPricingEngine {
         uint256 minVol_,
         uint256 maxVol_
     ) {
+        if (keeper_ == address(0)) revert InvalidInput();
         if (sampleInterval_ == 0 || windowSize_ < 2) revert InvalidInput();
         if (minVol_ == 0 || maxVol_ <= minVol_) revert InvalidInput();
-        minVolatility = minVol_;
-        maxVolatility = maxVol_;
         keeper = keeper_;
         sampleInterval = sampleInterval_;
         windowSize = windowSize_;
         riskFreeRate = riskFree_;
-        _returns = new int256[](windowSize_);
+        minVolatility = minVol_;
+        maxVolatility = maxVol_;
+        _sqReturns = new uint256[](windowSize_);
+        _gaps = new uint256[](windowSize_);
     }
 
     // ------------------------------------------------------------------
@@ -74,19 +84,20 @@ contract PricingEngine is IPricingEngine {
 
         uint256 prev = lastPrice;
         if (prev != 0) {
-            if (block.timestamp < lastTimestamp + sampleInterval) revert InvalidInput();
-            int256 r = unwrap(ln(sd(int256(spot)) / sd(int256(prev))));
+            uint256 gap = block.timestamp - lastTimestamp;
+            if (gap < sampleInterval) revert InvalidInput();
+            uint256 rSq = _sq(unwrap(ln(sd(int256(spot)) / sd(int256(prev)))));
 
             if (_count == windowSize) {
-                int256 old = _returns[_head];
-                _sum -= old;
-                _sumSq -= _sq(old);
+                _sumSq -= _sqReturns[_head];
+                _sumGap -= _gaps[_head];
             } else {
                 _count++;
             }
-            _returns[_head] = r;
-            _sum += r;
-            _sumSq += _sq(r);
+            _sqReturns[_head] = rSq;
+            _gaps[_head] = gap;
+            _sumSq += rSq;
+            _sumGap += gap;
             _head = (_head + 1) % windowSize;
         }
         lastPrice = spot;
@@ -105,14 +116,8 @@ contract PricingEngine is IPricingEngine {
 
     /// @notice Unclamped annualised realized volatility (1e18).
     function rawVolatility() public view returns (uint256) {
-        uint256 n = _count;
-        if (n < 2) revert InsufficientHistory();
-        // sample variance = (sumSq - sum^2 / n) / (n - 1)
-        uint256 meanSq = _sq(_sum) / n;
-        uint256 ss = _sumSq > meanSq ? _sumSq - meanSq : 0;
-        uint256 perPeriodVar = ss / (n - 1);
-        // annualise: variance scales linearly with time
-        uint256 annualVar = perPeriodVar * SECONDS_PER_YEAR / sampleInterval;
+        if (_count < 2) revert InsufficientHistory();
+        uint256 annualVar = _sumSq * SECONDS_PER_YEAR / _sumGap;
         return uint256(unwrap(sqrt(sd(int256(annualVar)))));
     }
 
@@ -152,26 +157,34 @@ contract PricingEngine is IPricingEngine {
     }
 
     /// @inheritdoc IPricingEngine
-    /// @dev Delta is strictly decreasing in strike, so bisection converges. Search range
-    ///      [spot/4, 4*spot]; reverts if target delta is not bracketed.
+    /// @dev Invert delta = N(d1) by bisecting on d1 (cheap: no ln/sqrt per step), then recover the
+    ///      strike in closed form from d1 = [ln(S/K) + (r + v^2/2) T] / (v sqrt(T)):
+    ///          K = S * exp((r + v^2/2) T - d1 * v * sqrt(T)).
+    ///      No strike bracket, so extreme vol / tenor combinations still resolve.
     function strikeForDelta(uint256 spot, uint256 vol, uint256 timeToExpiry, uint256 targetDelta)
         external
         view
         returns (uint256 strike)
     {
+        if (spot == 0 || vol == 0 || timeToExpiry == 0) revert InvalidInput();
         if (targetDelta == 0 || targetDelta >= 1e18) revert InvalidInput();
-        uint256 lo = spot / 4;
-        uint256 hi = spot * 4;
-        if (
-            callDelta(spot, lo, vol, timeToExpiry) < targetDelta
-                || callDelta(spot, hi, vol, timeToExpiry) > targetDelta
-        ) revert InvalidInput();
-        for (uint256 i; i < MAX_SEARCH_ITERS; ++i) {
-            uint256 mid = (lo + hi) / 2;
-            if (callDelta(spot, mid, vol, timeToExpiry) > targetDelta) lo = mid;
+
+        int256 lo = -D_BOUND;
+        int256 hi = D_BOUND;
+        int256 target = int256(targetDelta);
+        for (uint256 i; i < DELTA_SEARCH_ITERS; ++i) {
+            int256 mid = (lo + hi) / 2;
+            if (_cdf(mid) < target) lo = mid;
             else hi = mid;
         }
-        strike = (lo + hi) / 2;
+        int256 d1 = (lo + hi) / 2;
+
+        SD59x18 t = sd(_years(timeToExpiry));
+        SD59x18 v = sd(int256(vol));
+        SD59x18 exponent = (sd(riskFreeRate) + v * v / sd(2e18)) * t - sd(d1) * v * sqrt(t);
+        int256 k = unwrap(sd(int256(spot)) * exp(exponent));
+        if (k <= 0) revert InvalidInput();
+        strike = uint256(k);
     }
 
     /// @dev seconds -> years, 1e18

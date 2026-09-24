@@ -44,8 +44,10 @@ forge build && forge test
   roughly (S + K*e^-rT) * 7.5e-8 (about 1.5e-5 at S = 100). Tests derive their tolerances from
   this bound rather than an arbitrary epsilon.
 - The approximation has a ~1e-9 discontinuity at x = 0 (N(0) is not exactly 0.5); inside the bound.
-- `strikeForDelta` bisects over [S/4, 4S] and reverts if the target delta is not bracketed
-  (e.g. 10-delta at 300% vol and 60 days). Fine for the weekly ~30-delta use case.
+- `strikeForDelta` inverts delta by bisecting on d1 (no strike bracket, about 0.5M gas), then
+  recovers the strike in closed form.
+- Realized vol is `sum(r^2) / sum(dt)` over a rolling window using the real gap between snapshots
+  (so a delayed snapshot does not inflate vol), clamped to [`minVolatility`, `maxVolatility`].
 - Reference vectors: `script/gen_vectors.py` writes `test/vectors/bs_vectors.json` (400 cases,
   exact CDF via `math.erfc`, identical to `scipy.stats.norm.cdf`).
 
@@ -54,11 +56,15 @@ forge build && forge test
   once sold out or the writing window closes) -> `beginSettlement` (after expiry) -> `settle`.
 - **Strike and premium are fixed at `startEpoch`** from spot, realized vol and the 30-delta target,
   so buyers cannot game them during the writing window. Premium rounds up (favours the vault).
-- **Deposits/withdrawals only in Idle**, so collateral cannot move mid-epoch.
+- **Deposits/withdrawals only in Idle**, so collateral cannot move mid-epoch. Idle lasts at least
+  `idleWindow` after every epoch, so depositors always get an exit window.
+- **Stale-quote guard:** `buyOptions` reverts if spot has moved more than `maxSpotDeviationBps` from
+  the epoch-start spot. **Premium markup** (`premiumMarkupBps`) adds a cushion over fair value.
+- **Unsold epochs are skipped:** if nothing is bought, the vault returns to Idle with no lock-up.
 - **Premium is USDC, share price is WETH.** USDC premium streams to shareholders via a per-share
   accumulator (settled on every mint/burn/transfer), so it is not mixed into `totalAssets`.
 - **Cash-settled in WETH:** payout per option = (S - K) / S, rounded down. `settle` reserves the
-  total (`reservedPayout`, excluded from `totalAssets`); holders call `redeem` to claim. Payout per
+  total (`reservedPayout`, excluded from `totalAssets`); holders call `redeemOptions` to claim. Payout per
   option is always < 1 WETH, so payouts can never exceed locked collateral.
 - **Virtual-share offset (3)** on the ERC-4626 to blunt first-depositor inflation attacks.
 
@@ -90,7 +96,9 @@ formula) confirms the suite fails on a real accounting bug.
 
 ### Known limitations / trust assumptions
 - Trust the Chainlink ETH/USD feed and its heartbeat/deviation configuration.
-- If a Chainlink aggregator phase change falls between the last pre-expiry round and the latest round,
-  `submitExpiryRound` cannot verify the successor and refuses; settlement stalls until resolved.
+- Chainlink phase changes are handled (successor lookup crosses phase boundaries). If the feed was
+  stale at expiry, settlement is refused until `fallbackDelay` has passed, then the same
+  deterministic round is accepted, so an oracle outage delays settlement but cannot lock funds.
+- The full pre-Phase-4 design audit (14 fixes, accepted risks) is in `docs/pre-p4-audit.md`.
 - Realized vol is sampled from the same feed, so it inherits the feed's update cadence (a stale
   answer repeated across samples looks like zero vol; the floor covers that).

@@ -29,7 +29,7 @@ interface IPricingEngine {
         view
         returns (uint256);
 
-    /// @notice Strike whose call delta is closest to `targetDelta` (1e18, e.g. 0.3e18).
+    /// @notice Strike whose call delta equals `targetDelta` (1e18, e.g. 0.3e18), solved in d1-space.
     function strikeForDelta(uint256 spot, uint256 vol, uint256 timeToExpiry, uint256 targetDelta)
         external
         view

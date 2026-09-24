@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
-import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IOptionsVault} from "./interfaces/IOptionsVault.sol";
 import {PricingEngine} from "./PricingEngine.sol";
 import {SettlementResolver} from "./SettlementResolver.sol";
@@ -21,6 +21,9 @@ interface AutomationCompatibleInterface {
 ///         hourly price snapshots for the volatility window, and the epoch lifecycle.
 /// @dev `checkUpkeep` runs off-chain (simulated); `performUpkeep` re-validates every condition so
 ///      a forged `performData` can at worst trigger an action that was legitimately due.
+///      If a lifecycle action unexpectedly reverts, a due snapshot is still recorded so the
+///      volatility window never starves; if no snapshot is due the whole call reverts, which keeps
+///      Automation from burning gas on a no-op every block.
 contract VaultKeeper is AutomationCompatibleInterface {
     enum Action {
         None,
@@ -34,10 +37,13 @@ contract VaultKeeper is AutomationCompatibleInterface {
 
     error NotForwarder();
     error NotOwner();
+    error NotSelf();
     error AlreadyInitialised();
     error NotNeeded();
+    error ZeroAddress();
 
-    uint256 internal constant MAX_ROUND_LOOKBACK = 100;
+    uint256 internal constant LINEAR_LOOKBACK = 100;
+    uint256 internal constant AGG_MASK = type(uint64).max;
 
     address public immutable owner;
     /// @notice Automation forwarder for this upkeep; only it may call performUpkeep.
@@ -51,6 +57,7 @@ contract VaultKeeper is AutomationCompatibleInterface {
 
     event ForwarderSet(address indexed forwarder);
     event Performed(Action indexed action);
+    event ActionFailed(Action indexed action);
 
     constructor(uint256 minSamples_) {
         owner = msg.sender;
@@ -66,6 +73,10 @@ contract VaultKeeper is AutomationCompatibleInterface {
     ) external {
         if (msg.sender != owner) revert NotOwner();
         if (address(engine) != address(0)) revert AlreadyInitialised();
+        if (
+            address(engine_) == address(0) || address(vault_) == address(0)
+                || address(resolver_) == address(0) || address(feed_) == address(0)
+        ) revert ZeroAddress();
         engine = engine_;
         vault = vault_;
         resolver = resolver_;
@@ -96,6 +107,26 @@ contract VaultKeeper is AutomationCompatibleInterface {
             revert NotNeeded();
         }
 
+        try this.execute(a, data) {
+            emit Performed(a);
+        } catch (bytes memory reason) {
+            emit ActionFailed(a);
+            // Don't let a stuck lifecycle action starve the vol window.
+            if (a != Action.Snapshot && _snapshotDue()) {
+                this.execute(Action.Snapshot, "");
+                emit Performed(Action.Snapshot);
+            } else {
+                // bubble the revert so Automation's simulation fails instead of sending a no-op
+                assembly ("memory-safe") {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
+        }
+    }
+
+    /// @dev External only so `performUpkeep` can wrap it in try/catch. Not callable by others.
+    function execute(Action a, bytes calldata data) external {
+        if (msg.sender != address(this)) revert NotSelf();
         if (a == Action.Snapshot) {
             engine.recordSnapshot(resolver.spot());
         } else if (a == Action.StartEpoch) {
@@ -109,7 +140,6 @@ contract VaultKeeper is AutomationCompatibleInterface {
         } else if (a == Action.Settle) {
             vault.settle();
         }
-        emit Performed(a);
     }
 
     /// @dev Lifecycle actions take priority over snapshots (they are rare and time-critical).
@@ -136,30 +166,58 @@ contract VaultKeeper is AutomationCompatibleInterface {
                 return (Action.Activate, "");
             }
         } else if (s == IOptionsVault.State.Idle) {
+            // Start only after the depositor exit window, with assets to lock, enough vol history,
+            // a snapshot taken within the last interval (so vol is current), and a healthy oracle.
             if (
-                IERC4626(address(vault)).totalAssets() > 0 && engine.sampleCount() >= minSamples
-                    && _spotOk()
+                block.timestamp >= vault.idleSince() + vault.idleWindow()
+                    && IERC4626(address(vault)).totalAssets() > 0
+                    && engine.sampleCount() >= minSamples && !_snapshotDue() && _spotOk()
             ) {
                 return (Action.StartEpoch, "");
             }
         }
 
-        if (block.timestamp >= engine.lastTimestamp() + engine.sampleInterval() && _spotOk()) {
-            return (Action.Snapshot, "");
-        }
+        if (_snapshotDue() && _spotOk()) return (Action.Snapshot, "");
         return (Action.None, "");
     }
 
-    /// @dev Walks back from the latest round to the last round with updatedAt <= expiry.
+    function _snapshotDue() internal view returns (bool) {
+        return block.timestamp >= engine.lastTimestamp() + engine.sampleInterval();
+    }
+
+    /// @dev The last round with updatedAt <= expiry. Cheap linear scan back from the latest round
+    ///      covers the normal case; if the upkeep was delayed for long, binary search over the
+    ///      aggregator round range of the latest phase (round timestamps are monotonic).
     function _findExpiryRound(uint256 expiry) internal view returns (bool, uint80) {
         (uint80 latest,,,,) = feed.latestRoundData();
-        for (uint256 i; i < MAX_ROUND_LOOKBACK && i <= latest; ++i) {
+        uint256 agg = uint256(latest) & AGG_MASK;
+        for (uint256 i; i < LINEAR_LOOKBACK && i < agg; ++i) {
             uint80 id = latest - uint80(i);
-            try feed.getRoundData(id) returns (uint80, int256, uint256, uint256 u, uint80) {
-                if (u != 0 && u <= expiry) return (true, id);
-            } catch {}
+            uint256 u = _updatedAt(id);
+            if (u != 0 && u <= expiry) return (true, id);
         }
-        return (false, 0);
+
+        uint256 base = uint256(latest) & ~AGG_MASK;
+        uint256 lo = 1;
+        uint256 hi = agg;
+        if (hi == 0) return (false, 0);
+        uint256 uLo = _updatedAt(uint80(base | lo));
+        if (uLo == 0 || uLo > expiry) return (false, 0); // needs a previous phase; submit manually
+        while (lo < hi) {
+            uint256 mid = (lo + hi + 1) / 2;
+            uint256 u = _updatedAt(uint80(base | mid));
+            if (u != 0 && u <= expiry) lo = mid;
+            else hi = mid - 1;
+        }
+        return (true, uint80(base | lo));
+    }
+
+    function _updatedAt(uint80 id) internal view returns (uint256) {
+        try feed.getRoundData(id) returns (uint80, int256, uint256, uint256 u, uint80) {
+            return u;
+        } catch {
+            return 0;
+        }
     }
 
     function _spotOk() internal view returns (bool) {
