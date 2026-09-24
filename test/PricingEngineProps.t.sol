@@ -272,6 +272,87 @@ contract PricingEngineProps is Test {
         engine.strikeForDelta(2000e18, engine.realizedVolatility(), 7 days, 0.3e18);
     }
 
+    // ------------------------------------------------------------------
+    // Greeks
+    // ------------------------------------------------------------------
+
+    /// All 400 reference vectors, Greeks computed with exact closed forms in Python.
+    function test_greeksReferenceVectors() public view {
+        string memory json = vm.readFile("test/vectors/bs_vectors.json");
+        uint256[] memory spot = vm.parseJsonUintArray(json, ".spot");
+        uint256[] memory strike = vm.parseJsonUintArray(json, ".strike");
+        uint256[] memory vol = vm.parseJsonUintArray(json, ".vol");
+        uint256[] memory secs = vm.parseJsonUintArray(json, ".secs");
+        int256[] memory gamma = vm.parseJsonIntArray(json, ".gamma");
+        int256[] memory vega = vm.parseJsonIntArray(json, ".vega");
+        int256[] memory theta = vm.parseJsonIntArray(json, ".theta");
+        int256[] memory rho = vm.parseJsonIntArray(json, ".rho");
+
+        for (uint256 i; i < spot.length; ++i) {
+            PricingEngine.Greeks memory g = engine.callGreeks(spot[i], strike[i], vol[i], secs[i]);
+            // pdf-only Greeks (gamma, vega): fixed-point rounding only
+            assertApproxEqAbs(g.gamma, gamma[i], _tol(gamma[i], 0), "gamma");
+            assertApproxEqAbs(g.vega, vega[i], _tol(vega[i], 0), "vega");
+            // theta and rho carry the A&S CDF error through N(d2), scaled by K
+            assertApproxEqAbs(g.theta, theta[i], _tol(theta[i], strike[i]), "theta");
+            assertApproxEqAbs(g.rho, rho[i], _tol(rho[i], strike[i]), "rho");
+            // delta agrees with callDelta exactly
+            assertEq(uint256(g.delta), engine.callDelta(spot[i], strike[i], vol[i], secs[i]));
+        }
+    }
+
+    function _tol(int256 expected, uint256 cdfScaled) internal pure returns (uint256) {
+        uint256 mag = uint256(expected < 0 ? -expected : expected);
+        return mag / 1e7 + 1e6 + cdfScaled * CDF_ERR * 2 / 1e18;
+    }
+
+    /// Sign conventions and independent finite-difference cross-checks.
+    function testFuzz_greeksSignsAndFiniteDifference(uint256 vol, uint256 secs, uint256 kMul)
+        public
+        view
+    {
+        vol = bound(vol, 0.3e18, 2e18);
+        secs = bound(secs, 1 days, 30 days);
+        kMul = bound(kMul, 80, 130);
+        uint256 s = 2000e18;
+        uint256 k = s * kMul / 100;
+
+        PricingEngine.Greeks memory g = engine.callGreeks(s, k, vol, secs);
+        assertGe(g.gamma, 0);
+        assertGe(g.vega, 0);
+        assertLe(g.theta, 0); // r >= 0: a long call always decays
+        assertGe(g.rho, 0);
+
+        assertApproxEqAbs(g.delta, _fdDelta(s, k, vol, secs), 5e15); // 0.5%: CDF error / 2h
+        // Finite differences of prices carry the CDF error: (S+K)*7.5e-8*2 / (2*dv) ~ 0.3 USD per
+        // unit vol, so allow that as an absolute floor on top of a 5% relative band.
+        assertApproxEqAbs(g.vega, _fdVega(s, k, vol, secs), uint256(g.vega) / 20 + 0.5e18);
+    }
+
+    /// delta ~ (C(S+h) - C(S-h)) / 2h
+    function _fdDelta(uint256 s, uint256 k, uint256 vol, uint256 secs)
+        internal
+        view
+        returns (int256)
+    {
+        uint256 h = s / 1000;
+        int256 up = int256(engine.callPrice(s + h, k, vol, secs));
+        int256 dn = int256(engine.callPrice(s - h, k, vol, secs));
+        return (up - dn) * 1e18 / int256(2 * h);
+    }
+
+    /// vega ~ (C(v+dv) - C(v-dv)) / 2dv
+    function _fdVega(uint256 s, uint256 k, uint256 vol, uint256 secs)
+        internal
+        view
+        returns (int256)
+    {
+        uint256 dv = 1e15;
+        int256 up = int256(engine.callPrice(s, k, vol + dv, secs));
+        int256 dn = int256(engine.callPrice(s, k, vol - dv, secs));
+        return (up - dn) * 1e18 / int256(2 * dv);
+    }
+
     function test_constructorRejectsBadVolBounds() public {
         vm.expectRevert(abi.encodeWithSignature("InvalidInput()"));
         new PricingEngine(keeper, 1 hours, 24, 0, 0, 5e18);

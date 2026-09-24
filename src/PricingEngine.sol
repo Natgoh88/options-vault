@@ -157,6 +157,41 @@ contract PricingEngine is IPricingEngine {
     }
 
     /// @inheritdoc IPricingEngine
+    /// @dev Standard closed forms (no dividends):
+    ///        gamma = phi(d1) / (S v sqrt(T))
+    ///        vega  = S phi(d1) sqrt(T)
+    ///        theta = -S phi(d1) v / (2 sqrt(T)) - r K e^{-rT} N(d2)
+    ///        rho   = K T e^{-rT} N(d2)
+    function callGreeks(uint256 spot, uint256 strike, uint256 vol, uint256 timeToExpiry)
+        external
+        view
+        returns (Greeks memory g)
+    {
+        (int256 d1, int256 d2) = _d1d2(spot, strike, vol, timeToExpiry);
+        SD59x18 s = sd(int256(spot));
+        SD59x18 v = sd(int256(vol));
+        SD59x18 t = sd(_years(timeToExpiry));
+        SD59x18 sqrtT = sqrt(t);
+        SD59x18 pdf = sd(_pdf(d1));
+
+        g.delta = _cdf(d1);
+        g.gamma = unwrap(pdf / (s * v * sqrtT));
+        g.vega = unwrap(s * pdf * sqrtT);
+
+        SD59x18 discK = sd(int256(strike)) * exp(-(sd(riskFreeRate) * t));
+        SD59x18 nd2 = sd(_cdf(d2));
+        g.theta = unwrap(-(s * pdf * v) / (sd(2e18) * sqrtT) - sd(riskFreeRate) * discK * nd2);
+        g.rho = unwrap(discK * t * nd2);
+    }
+
+    /// @dev Standard normal density, 0 beyond 8 sigma (value < 1e-14).
+    function _pdf(int256 x) internal pure returns (int256) {
+        if (x > D_BOUND || x < -D_BOUND) return 0;
+        SD59x18 sx = sd(x);
+        return unwrap(sd(INV_SQRT_2PI) * exp(-(sx * sx) / sd(2e18)));
+    }
+
+    /// @inheritdoc IPricingEngine
     /// @dev Invert delta = N(d1) by bisecting on d1 (cheap: no ln/sqrt per step), then recover the
     ///      strike in closed form from d1 = [ln(S/K) + (r + v^2/2) T] / (v sqrt(T)):
     ///          K = S * exp((r + v^2/2) T - d1 * v * sqrt(T)).

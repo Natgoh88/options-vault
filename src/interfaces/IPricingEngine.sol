@@ -29,6 +29,25 @@ interface IPricingEngine {
         view
         returns (uint256);
 
+    /// @dev Raw Black-Scholes sensitivities, all 1e18 fixed-point and per unit of input:
+    ///      delta  dC/dS                 gamma  d2C/dS2
+    ///      vega   dC/dsigma (per 1.00 = 100 vol points)
+    ///      theta  dC/dt (per year, negative for a long call)
+    ///      rho    dC/dr (per 1.00 = 100 rate points)
+    struct Greeks {
+        int256 delta;
+        int256 gamma;
+        int256 vega;
+        int256 theta;
+        int256 rho;
+    }
+
+    /// @notice All call Greeks in one call, from the same d1/d2 and CDF as `callPrice`.
+    function callGreeks(uint256 spot, uint256 strike, uint256 vol, uint256 timeToExpiry)
+        external
+        view
+        returns (Greeks memory);
+
     /// @notice Strike whose call delta equals `targetDelta` (1e18, e.g. 0.3e18), solved in d1-space.
     function strikeForDelta(uint256 spot, uint256 vol, uint256 timeToExpiry, uint256 targetDelta)
         external

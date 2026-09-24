@@ -5,3 +5,11 @@ broadcast/
 *.log
 node_modules/
 .DS_Store
+
+# frontend
+dist/
+.env*.local
+.claude/
+# local anvil deployment (dev only)
+deployments/31337.json
+frontend/src/deployments.local.json

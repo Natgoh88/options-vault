@@ -28,7 +28,7 @@ delta and mainnet are stretch goals.
 - [x] Phase 2: Vault + OptionToken (invariant-tested)
 - [x] Phase 3: Oracle + settlement (Automation-driven; upkeep registration is a Phase 5 deploy step)
 - [x] Phase 4: Security pass (see docs/security-report.md)
-- [ ] Phase 5: Frontend + deploy
+- [~] Phase 5: Frontend + deploy (frontend, deploy script and on-chain Greeks done; live testnet deployment and Vercel are user-run steps, see `docs/deployment.md`)
 - [ ] Phase 6: Polish
 
 See the full plan in `docs/action-plan.md`.
@@ -37,7 +37,21 @@ See the full plan in `docs/action-plan.md`.
 ```
 git clone --recurse-submodules <repo>
 forge build && forge test
+cd frontend && npm install && npm run dev
 ```
+
+## Frontend (Phase 5)
+`frontend/` is a Vite + React + TypeScript app using viem directly (no wallet-kit dependency) and
+the self-hosted Inter variable font. It shows vault TVL, the live Chainlink price and the
+contract's realized vol, the epoch lifecycle, a payoff-at-expiry chart, **live Greeks read from
+`PricingEngine.callGreeks`**, epoch history, and handles deposit, withdraw, buying options,
+redeeming and claiming premium. Deposits and withdrawals are gated by the vault state, with the
+reason and time remaining shown. Deployment steps and the local dev harness are in
+`docs/deployment.md`.
+
+`PricingEngine.callGreeks` returns delta, gamma, vega, theta and rho from the same d1/d2 and CDF as
+the premium. All 400 reference vectors (exact closed forms from Python) plus sign and
+finite-difference property tests pass.
 
 ## PricingEngine accuracy and limits
 - Normal CDF: Abramowitz & Stegun 26.2.17, absolute error <= 7.5e-8. This propagates to price as

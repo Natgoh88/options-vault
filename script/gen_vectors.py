@@ -25,6 +25,21 @@ def bs_call(s, k, vol, t_years, r=R):
     return price, ncdf(d1)
 
 
+def greeks(s, k, vol, t_years, r=R):
+    """Exact call Greeks (per unit: vega per 1.00 vol, theta per year, rho per 1.00 rate)."""
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(s / k) + (r + vol * vol / 2) * t_years) / (vol * sqrt_t)
+    d2 = d1 - vol * sqrt_t
+    pdf = math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi)
+    disc_k = k * math.exp(-r * t_years)
+    return {
+        "gamma": pdf / (s * vol * sqrt_t),
+        "vega": s * pdf * sqrt_t,
+        "theta": -s * pdf * vol / (2 * sqrt_t) - r * disc_k * ncdf(d2),
+        "rho": disc_k * t_years * ncdf(d2),
+    }
+
+
 def fx(x: float) -> str:
     return str(int(round(x * SCALE)))
 
@@ -41,6 +56,7 @@ for s in spots:
             for secs in times:
                 k = s * m
                 price, delta = bs_call(s, k, v, secs / YEAR)
+                g = greeks(s, k, v, secs / YEAR)
                 rows.append(
                     {
                         "spot": fx(s),
@@ -49,11 +65,15 @@ for s in spots:
                         "secs": str(secs),
                         "price": fx(price),
                         "delta": fx(delta),
+                        "gamma": fx(g["gamma"]),
+                        "vega": fx(g["vega"]),
+                        "theta": fx(g["theta"]),
+                        "rho": fx(g["rho"]),
                     }
                 )
 
 out = {"rate": fx(R), "n": len(rows)}
-for key in ["spot", "strike", "vol", "secs", "price", "delta"]:
+for key in ["spot", "strike", "vol", "secs", "price", "delta", "gamma", "vega", "theta", "rho"]:
     out[key] = [r[key] for r in rows]
 
 path = pathlib.Path(__file__).resolve().parent.parent / "test" / "vectors" / "bs_vectors.json"

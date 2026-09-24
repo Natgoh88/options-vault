@@ -18,10 +18,10 @@ Contracts in `src/`: `OptionsVault`, `PricingEngine`, `OptionToken`, `Settlement
 
 | Check | Result |
 |---|---|
-| Test suite | 110 tests, 0 failing (13 suites) |
+| Test suite | 117 tests, 0 failing (15 suites) |
 | Line coverage, `src/` | **100%** for every contract (branch coverage 89.8% overall) |
 | Fuzz | 1,000 runs per fuzz test |
-| Invariants (7) | 256 runs default; **10,000 runs, 640,000 calls, 0 reverts, all hold**; 50,000-run result: see section 6 |
+| Invariants (7) | 256 runs default; **10,000 runs (640,000 calls) and 50,000 runs (3,200,000 calls), 0 reverts, all hold** |
 | Mutation checks | Doubling the payout formula fails 2 invariants; removing `nonReentrant` from `buyOptions` fails all 3 tests that re-enter a guarded function |
 | Slither | 0 High, 10 Medium, 16 Low, 2 Informational; all triaged below |
 
@@ -94,9 +94,11 @@ No unfixed High or Medium issue is known. That is not the same as none existing.
 
 ## 6. Invariants at scale
 
-- 10,000 runs / 640,000 calls / 0 reverts (ran before the pre-Phase-4 hardening changes).
-- 50,000-run campaign on the hardened contracts: see the note appended below once it completes.
-  A nightly/on-demand workflow (`invariants-deep.yml`) repeats it in CI.
+- 10,000 runs / 640,000 calls / 0 reverts (before the pre-Phase-4 hardening changes).
+- **50,000 runs / 3,200,000 calls / 0 reverts, all 7 invariants hold**, on the hardened contracts
+  (run before the final checks-effects-interactions reorder of `redeemOptions`, which the default
+  256-run invariant suite and the reentrancy tests have covered since).
+- A nightly / on-demand workflow (`invariants-deep.yml`) repeats the 50,000-run campaign in CI.
 
 ## 7. Known limitations (not fixable in the MVP)
 
