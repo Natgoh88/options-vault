@@ -27,7 +27,7 @@ delta and mainnet are stretch goals.
 - [x] Phase 1: PricingEngine
 - [x] Phase 2: Vault + OptionToken (invariant-tested)
 - [x] Phase 3: Oracle + settlement (Automation-driven; upkeep registration is a Phase 5 deploy step)
-- [ ] Phase 4: Security pass
+- [x] Phase 4: Security pass (see docs/security-report.md)
 - [ ] Phase 5: Frontend + deploy
 - [ ] Phase 6: Polish
 

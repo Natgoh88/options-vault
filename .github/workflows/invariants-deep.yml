@@ -1,0 +1,19 @@
+name: Deep invariants
+# Long-running invariant campaign. Not run on every push; nightly and on demand.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge test --match-path test/OptionsVault.invariant.t.sol
+        env:
+          FOUNDRY_INVARIANT_RUNS: "50000"

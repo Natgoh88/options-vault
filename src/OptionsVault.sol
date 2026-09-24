@@ -266,8 +266,9 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         if (!e.settled) revert NotSettled();
         if (amount == 0) revert ZeroAmount();
         payout = Math.mulDiv(amount, e.payoutPerOption, 1e18); // rounds down
-        optionToken.burn(msg.sender, e.strike, e.expiry, amount);
+        // effects before interactions (checks-effects-interactions)
         reservedPayout -= payout;
+        optionToken.burn(msg.sender, e.strike, e.expiry, amount);
         IERC20(asset()).safeTransfer(msg.sender, payout);
         emit OptionsRedeemed(epoch, msg.sender, amount, payout);
     }

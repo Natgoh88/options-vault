@@ -15,3 +15,18 @@ jobs:
       - run: forge fmt --check
       - run: forge build --sizes
       - run: forge test -vvv
+
+  slither:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install slither-analyzer
+      # Fails the build on High-impact findings. Lower-severity findings are triaged in
+      # docs/security-report.md; slither.config.json holds the path filters.
+      - run: slither . --fail-high
