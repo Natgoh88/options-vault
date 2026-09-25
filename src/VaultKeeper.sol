@@ -58,6 +58,9 @@ contract VaultKeeper is AutomationCompatibleInterface {
     AggregatorV3Interface public feed;
 
     event ForwarderSet(address indexed forwarder);
+    event Initialised(
+        address indexed engine, address indexed vault, address indexed resolver, address feed
+    );
     event Performed(Action indexed action);
     event ActionFailed(Action indexed action);
 
@@ -83,6 +86,7 @@ contract VaultKeeper is AutomationCompatibleInterface {
         vault = vault_;
         resolver = resolver_;
         feed = feed_;
+        emit Initialised(address(engine_), address(vault_), address(resolver_), address(feed_));
     }
 
     function setForwarder(address forwarder_) external {

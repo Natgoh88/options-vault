@@ -94,7 +94,7 @@ if (ATTACH) {
   console.log(`attached to vault ${dep.vault}, ETH ${price.toFixed(2)}`);
 } else {
   console.log("deploying mocks (WETH, ETH/USD feed)");
-  const weth = await deployMock("Mocks.sol", "MockERC20", ["Wrapped Ether", "WETH", 18]);
+  const weth = await deployMock("Mocks.sol", "MockWETH", []); // WETH9-compatible: wrap works
   const feed = await deployMock("Mocks.sol", "MockAggregator", [8]);
   wethAddr = weth.address;
   feedAddr = feed.address;

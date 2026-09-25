@@ -151,7 +151,7 @@ docs/           security report, design audits, deployment guide, demo script, c
 ```bash
 git clone --recurse-submodules https://github.com/Natgoh88/options-vault.git
 cd options-vault
-forge build && forge test                     # 125+ tests
+forge build && forge test                     # 126 tests
 FOUNDRY_INVARIANT_RUNS=50000 forge test --match-path test/OptionsVault.invariant.t.sol
 cd frontend && npm install && npm run dev
 ```

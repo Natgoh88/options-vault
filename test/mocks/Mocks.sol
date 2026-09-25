@@ -21,6 +21,25 @@ contract MockERC20 is ERC20 {
     }
 }
 
+/// WETH9-compatible mock (deposit / withdraw), so local runs exercise the real "wrap ETH" path.
+/// Storage layout is identical to MockERC20.
+contract MockWETH is MockERC20 {
+    constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
+
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external {
+        _burn(msg.sender, amount);
+        payable(msg.sender).transfer(amount);
+    }
+
+    receive() external payable {
+        _mint(msg.sender, msg.value);
+    }
+}
+
 /// Simple test double for the resolver, used by vault-only tests.
 contract MockResolver is ISettlementResolver {
     uint256 public price;

@@ -37,8 +37,8 @@ export function Footer() {
             <a href={`${REPO}/blob/main/docs/security-report.md`} target="_blank" rel="noreferrer">
               Security report
             </a>
-            <a href={`${REPO}/blob/main/docs/pre-p4-audit.md`} target="_blank" rel="noreferrer">
-              Design audit
+            <a href={`${REPO}/blob/main/docs/post-p5-audit.md`} target="_blank" rel="noreferrer">
+              Design audits
             </a>
           </div>
         </div>
