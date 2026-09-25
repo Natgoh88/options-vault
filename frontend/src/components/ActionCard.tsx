@@ -5,6 +5,7 @@ import { usdcAbi, vaultAbi } from "../abi";
 import { wethAbi } from "../erc20";
 import { writeTx } from "../tx";
 import type { Wallet } from "../wallet";
+import { ConnectButton } from "./ConnectButton";
 import type { Snapshot } from "../vault";
 import type { WalletClient, Hash } from "viem";
 
@@ -51,11 +52,7 @@ export function ActionCard({ snap, wallet, now, run, onError }: Props) {
 
 function Gate({ wallet, onError, children }: { wallet: Wallet; onError: (m: string) => void; children: React.ReactNode }) {
   if (!wallet.address) {
-    return (
-      <button className="btn primary lg" onClick={() => wallet.connect().catch((e) => onError((e as Error).message))}>
-        Connect wallet
-      </button>
-    );
+    return <ConnectButton wallet={wallet} onError={onError} large />;
   }
   if (wallet.wrongNetwork) {
     return (
@@ -407,7 +404,16 @@ function Options({ snap, wallet, run, onError, now }: Props) {
           </div>
           {positions.map((e) => {
             const bal = u.options[e.id];
-            const payout = e.settled ? (bal * e.payoutPerOption) / 10n ** 18n : 0n;
+            // cancelled epochs refund the USDC premium (6 dec); settled ones pay WETH (18 dec)
+            const refund = e.cancelled ? (bal * e.premiumPerOption) / 10n ** 18n : 0n;
+            const payout = e.settled && !e.cancelled ? (bal * e.payoutPerOption) / 10n ** 18n : 0n;
+            const status = e.cancelled
+              ? `cancelled, refund ${fmtNum(toNum(refund, 6), 2)} USDC`
+              : e.settled
+                ? payout > 0n
+                  ? `pays ${fmtToken(payout, 18, 6)} WETH`
+                  : "expired worthless"
+                : "awaiting settlement";
             return (
               <div className="pos-row num" key={e.id}>
                 <div>
@@ -415,15 +421,15 @@ function Options({ snap, wallet, run, onError, now }: Props) {
                     {fmtToken(bal, 18, 4)} WETH {"·"} strike {fmtUsd(toNum(e.strike), 0)}
                   </div>
                   <div className="faint" style={{ fontSize: 12 }}>
-                    Epoch #{e.id} {"·"} {e.settled ? (payout > 0n ? `pays ${fmtToken(payout, 18, 6)} WETH` : "expired worthless") : "awaiting settlement"}
+                    Epoch #{e.id} {"·"} {status}
                   </div>
                 </div>
                 {e.settled && (
                   <button
                     className="btn sm"
-                    onClick={() => run(`Redeem epoch #${e.id}`, (c) => writeTx(c, d.vault, vaultAbi, "redeemOptions", [BigInt(e.id), bal]))}
+                    onClick={() => run(e.cancelled ? `Refund epoch #${e.id}` : `Redeem epoch #${e.id}`, (c) => writeTx(c, d.vault, vaultAbi, "redeemOptions", [BigInt(e.id), bal]))}
                   >
-                    {payout > 0n ? "Redeem" : "Clear"}
+                    {e.cancelled ? "Refund" : payout > 0n ? "Redeem" : "Clear"}
                   </button>
                 )}
               </div>

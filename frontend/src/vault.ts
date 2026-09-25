@@ -20,6 +20,7 @@ export interface Epoch {
   settlementPrice: bigint;
   payoutPerOption: bigint; // WETH (1e18) per 1e18 options
   settled: boolean;
+  cancelled: boolean; // under the minimum fill: premium refunded, nothing locked
 }
 
 export interface Greeks {
@@ -57,6 +58,7 @@ export interface Snapshot {
   targetDelta: bigint;
   maxDeviationBps: number;
   markupBps: number;
+  minFillBps: number;
   sampleCount: number;
   spot?: bigint;
   vol?: bigint;
@@ -121,6 +123,7 @@ async function load(user: Address | undefined): Promise<Snapshot> {
       { ...v, functionName: "targetDelta" },
       { ...v, functionName: "maxSpotDeviationBps" },
       { ...v, functionName: "premiumMarkupBps" },
+      { ...v, functionName: "minFillBps" },
       { address: d.resolver, abi: resolverAbi as Abi, functionName: "spot" },
       { ...e, functionName: "realizedVolatility" },
       { ...e, functionName: "sampleCount" },
@@ -131,8 +134,8 @@ async function load(user: Address | undefined): Promise<Snapshot> {
   const currentEpoch = Number(s1[1] ?? 0);
   const epochDuration = Number(s1[7] ?? 0);
   const targetDelta = (s1[9] as bigint) ?? 0n;
-  const spot = s1[12] as bigint | undefined;
-  const vol = s1[13] as bigint | undefined;
+  const spot = s1[13] as bigint | undefined;
+  const vol = s1[14] as bigint | undefined;
   const chainTime = Number(block.timestamp);
 
   // ---- epochs (newest first) ----
@@ -158,6 +161,7 @@ async function load(user: Address | undefined): Promise<Snapshot> {
         settlementPrice: r.settlementPrice as bigint,
         payoutPerOption: r.payoutPerOption as bigint,
         settled: r.settled as boolean,
+        cancelled: Boolean(r.cancelled),
       },
     ];
   });
@@ -187,7 +191,8 @@ async function load(user: Address | undefined): Promise<Snapshot> {
     targetDelta,
     maxDeviationBps: Number(s1[10] ?? 0),
     markupBps: Number(s1[11] ?? 0),
-    sampleCount: Number(s1[14] ?? 0),
+    minFillBps: Number(s1[12] ?? 0),
+    sampleCount: Number(s1[15] ?? 0),
     spot,
     vol,
     epochs,

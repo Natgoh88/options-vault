@@ -1,6 +1,7 @@
 import { chain } from "../chain";
 import { shortAddr } from "../format";
 import type { Wallet } from "../wallet";
+import { ConnectButton } from "./ConnectButton";
 
 export function Mark({ size = 20 }: { size?: number }) {
   // a call-option payoff: flat, then a hockey-stick up and to the right
@@ -13,8 +14,6 @@ export function Mark({ size = 20 }: { size?: number }) {
 }
 
 export function Header({ wallet, onError }: { wallet: Wallet; onError: (m: string) => void }) {
-  const connect = () => wallet.connect().catch((e) => onError((e as Error).message));
-
   return (
     <header className="header">
       <div className="shell">
@@ -28,15 +27,13 @@ export function Header({ wallet, onError }: { wallet: Wallet; onError: (m: strin
             {chain.name}
           </span>
           {!wallet.address ? (
-            <button className="btn primary" onClick={connect}>
-              Connect wallet
-            </button>
+            <ConnectButton wallet={wallet} onError={onError} />
           ) : wallet.wrongNetwork ? (
             <button className="btn primary" onClick={() => wallet.switchNetwork().catch((e) => onError((e as Error).message))}>
               Switch to {chain.name}
             </button>
           ) : (
-            <button className="btn" onClick={wallet.disconnect} title="Disconnect">
+            <button className="btn" onClick={wallet.disconnect} title={`${wallet.walletName ?? "Wallet"} · click to disconnect`}>
               <span className="mono">{shortAddr(wallet.address)}</span>
             </button>
           )}

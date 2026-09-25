@@ -5,7 +5,7 @@ const Skel = () => <span className="skeleton" />;
 
 /** Premium collected / collateral at the time, for the most recent epoch that sold options. */
 export function lastEpochYield(snap: Snapshot): { yield: number; annualised?: number } | undefined {
-  const e = snap.epochs.find((x) => x.settled && x.optionsSold > 0n);
+  const e = snap.epochs.find((x) => x.settled && !x.cancelled && x.optionsSold > 0n);
   if (!e) return undefined;
   const premiumUsd = toNum(e.premiumCollected, 6);
   const collateralUsd = toNum(e.collateralLocked) * toNum(e.spotAtStart);

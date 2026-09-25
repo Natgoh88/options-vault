@@ -111,7 +111,8 @@ contract VaultHardeningTest is VaultBase {
             idleWindow: IDLE,
             targetDelta: 0.3e18,
             maxSpotDeviationBps: 100,
-            premiumMarkupBps: 200
+            premiumMarkupBps: 200,
+            minFillBps: MIN_FILL_BPS
         });
         IERC20 w = IERC20(address(weth));
         IERC20 u = IERC20(address(usdc));

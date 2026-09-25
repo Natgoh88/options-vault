@@ -3,7 +3,7 @@ import type { Epoch, Snapshot } from "../vault";
 
 function outcome(e: Epoch): { label: string; cls: string } {
   if (!e.settled) return { label: "Live", cls: "" };
-  if (e.optionsSold === 0n) return { label: "Skipped", cls: "faint" };
+  if (e.cancelled) return { label: e.optionsSold === 0n ? "No sale" : "Cancelled", cls: "faint" };
   return e.payoutPerOption > 0n ? { label: "ITM", cls: "neg" } : { label: "OTM", cls: "pos" };
 }
 
@@ -13,7 +13,7 @@ export function History({ snap }: { snap?: Snapshot }) {
     <section className="panel">
       <div className="panel-h">
         <h2>Epoch history</h2>
-        <span className="hint">ITM: option holders were paid. OTM: depositors kept collateral and premium.</span>
+        <span className="hint">ITM: holders were paid. OTM: depositors kept everything. Cancelled: under-filled, premium refunded.</span>
       </div>
       {rows.length === 0 ? (
         <div className="empty">{snap ? "No epochs yet. The first one starts once deposits and volatility history are in." : "Loading…"}</div>
@@ -41,10 +41,10 @@ export function History({ snap }: { snap?: Snapshot }) {
                     <td>
                       {fmtUsd(prem)} <span className="faint">{fmtPct(prem / spot0, 2)}</span>
                     </td>
-                    <td>{e.settled && e.optionsSold > 0n ? fmtUsd(toNum(e.settlementPrice)) : "—"}</td>
+                    <td>{e.settled && !e.cancelled ? fmtUsd(toNum(e.settlementPrice)) : "—"}</td>
                     <td>
                       <span className={o.cls}>{o.label}</span>
-                      {e.settled && e.optionsSold > 0n && e.payoutPerOption > 0n && (
+                      {e.settled && !e.cancelled && e.payoutPerOption > 0n && (
                         <span className="faint"> {fmtToken(e.payoutPerOption, 18, 4)} WETH</span>
                       )}
                     </td>

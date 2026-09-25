@@ -44,6 +44,7 @@ abstract contract VaultBase is Test {
     uint256 constant IDLE = 1 hours;
     uint256 constant MAX_DEV_BPS = 100; // 1%
     uint256 constant MARKUP_BPS = 200; // 2%
+    uint256 constant MIN_FILL_BPS = 1000; // 10% must sell or the epoch is cancelled
 
     function _deploy() internal {
         weth = new MockERC20("WETH", "WETH", 18);
@@ -65,7 +66,8 @@ abstract contract VaultBase is Test {
                 idleWindow: IDLE,
                 targetDelta: 0.3e18,
                 maxSpotDeviationBps: MAX_DEV_BPS,
-                premiumMarkupBps: MARKUP_BPS
+                premiumMarkupBps: MARKUP_BPS,
+                minFillBps: MIN_FILL_BPS
             })
         );
         token.setVault(address(vault));

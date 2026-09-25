@@ -1,118 +1,174 @@
 # Options Vault
 
-Fully on-chain automated covered-call vault on Arbitrum. Depositors supply WETH; each weekly epoch
-the vault writes ~30-delta calls against the full balance, pricing them with an on-chain
-Black-Scholes engine fed by a realized-volatility estimate the contract maintains itself.
-Spot comes from Chainlink; premium comes from math the contract runs.
+A covered-call vault on Arbitrum that runs entirely on-chain. It prices its own options with a
+fixed-point Black-Scholes engine, using a realized-volatility estimate it keeps itself, and settles
+against Chainlink with no discretion left to anyone.
 
-> **Testnet only. Not a financial product.**
+Depositors supply WETH. Each epoch the vault sells ~30-delta calls against that WETH and pays
+the premium to depositors in USDC. The contract computes the strike and the premium from spot and
+realized vol. No off-chain quote, no market maker and no admin sets the price.
 
-## Contracts
+> **Testnet only. Not a financial product.** Reviewed by its authors and heavily tested, but not
+> audited by a third party. See [Trust assumptions](#trust-assumptions) and
+> [Known limitations](#known-limitations).
+
+[![CI](https://github.com/Natgoh88/options-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/Natgoh88/options-vault/actions/workflows/ci.yml)
+
+## Why this is not just Dopex
+
+Dopex SSOVs use the same covered-call shape, and they work. The difference is where the price comes
+from. Here the **pricing is the product**. The contract implements Black-Scholes itself, in
+`SD59x18` fixed point: the normal CDF, the strike solve for a target delta, and all five Greeks. It
+also maintains its own realized-volatility estimate from oracle snapshots. Every premium can be
+traced back to a formula and a state anyone can read, with a stated error bound. That math is what
+this project defends under review; the vault around it is deliberately conventional.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Offchain[" "]
+        A[Chainlink Automation]
+    end
+    CL[(Chainlink<br/>ETH / USD)]
+    K[VaultKeeper]
+    PE[PricingEngine<br/>realized vol + Black-Scholes]
+    V[OptionsVault<br/>ERC-4626, WETH]
+    R[SettlementResolver]
+    OT[OptionToken<br/>ERC-1155]
+    D((Depositors))
+    B((Option buyers))
+
+    A -- performUpkeep --> K
+    K -- hourly snapshot --> PE
+    K -- start / activate / settle --> V
+    K -- expiry round --> R
+    CL --> R
+    R -- spot, settlement price --> V
+    PE -- strike, premium --> V
+    V -- mint / burn --> OT
+    D -- WETH in, USDC premium out --> V
+    B -- USDC premium in, WETH payout out --> V
+```
 
 | Contract | Role |
 |---|---|
-| `OptionsVault` (ERC-4626) | WETH custody, epoch state machine, share accounting |
-| `PricingEngine` | Realized vol (O(1) accumulators) + fixed-point Black-Scholes (PRBMath) |
-| `OptionToken` (ERC-1155) | One id per (strike, expiry) |
-| `SettlementResolver` | Chainlink read, staleness checks, ITM/OTM payout |
+| [`OptionsVault`](src/OptionsVault.sol) | ERC-4626 over WETH. Epoch state machine, collateral, USDC premium accumulator, payouts. |
+| [`PricingEngine`](src/PricingEngine.sol) | Realized vol (O(1) ring buffer) and Black-Scholes price, delta, Greeks, and strike-for-delta. Holds no funds. |
+| [`OptionToken`](src/OptionToken.sol) | ERC-1155 option positions, one id per (strike, expiry). Only the vault mints and burns. |
+| [`SettlementResolver`](src/SettlementResolver.sol) | Checked Chainlink spot; the deterministic settlement price per epoch. |
+| [`VaultKeeper`](src/VaultKeeper.sol) | One Chainlink Automation upkeep: vol snapshots and the whole epoch lifecycle. |
 
-Interfaces live in `src/interfaces/` and are the shared contract between workstreams.
+## How an epoch works
 
-## Scope (MVP)
-One asset (WETH), fixed-delta strike rule, weekly epochs, Arbitrum Sepolia. Multi-asset, dynamic
-delta and mainnet are stretch goals.
-
-## Status
-- [x] Phase 0: repo, interfaces, CI skeleton
-- [x] Phase 1: PricingEngine
-- [x] Phase 2: Vault + OptionToken (invariant-tested)
-- [x] Phase 3: Oracle + settlement (Automation-driven; upkeep registration is a Phase 5 deploy step)
-- [x] Phase 4: Security pass (see docs/security-report.md)
-- [~] Phase 5: Frontend + deploy (frontend, deploy script and on-chain Greeks done; live testnet deployment and Vercel are user-run steps, see `docs/deployment.md`)
-- [ ] Phase 6: Polish
-
-See the full plan in `docs/action-plan.md`.
-
-## Dev
 ```
-git clone --recurse-submodules <repo>
-forge build && forge test
+Idle ──startEpoch──▶ Writing ──activate──▶ Active ──beginSettlement──▶ Settling ──settle──▶ Idle
+ │ deposits and        │ options on sale     │ collateral locked        │ price recorded
+ │ withdrawals open    │ at a fixed price    │ until expiry             │ payouts reserved
+ │ (≥ idleWindow)      │                     │                          │
+ └─────────────────────┴── under minFillBps sold: cancelled, premium refunded, back to Idle
+```
+
+1. **Start (keeper only).** The contract reads spot and realized vol. It solves for the strike
+   whose delta is 0.30, prices the call, adds a safety markup and rounds up. Strike and premium are
+   then **fixed for the epoch**.
+2. **Writing.** Anyone buys options in USDC, up to the WETH collateral. Purchases revert if spot has
+   moved more than `maxSpotDeviationBps` since the start, so no one can buy a stale quote.
+3. **Activate (permissionless).** Once sold out or the window closes, the epoch goes live. If less
+   than `minFillBps` of the collateral sold, it is **cancelled** instead: depositors are released
+   immediately and buyers reclaim their premium. A dust purchase cannot lock the vault.
+4. **Settle (permissionless).** The settlement price is the **last Chainlink round at or before
+   expiry**. It is not a spot read at trigger time, so nothing in the settlement transaction can
+   move it. Each option pays `(price − strike) / price` WETH, rounded down. That total is reserved
+   and excluded from depositors' assets.
+5. **Idle.** An exit window of at least `idleWindow` before the next epoch. Premium accrues per
+   share and is claimable at any time.
+
+## The pricing engine
+
+| | |
+|---|---|
+| Price | `C = S·N(d1) − K·e^(−rT)·N(d2)`, in PRBMath `SD59x18` |
+| Normal CDF | Abramowitz & Stegun 26.2.17, absolute error ≤ 7.5e-8 |
+| Price error | ≤ (S + K·e^(−rT)) · 7.5e-8, about $0.0003 at S = K = $2,000 |
+| Strike solve | bisect on d1, then `K = S·exp((r + σ²/2)T − d1·σ√T)`; no bracket, about 0.5M gas |
+| Greeks | delta, gamma, vega, theta, rho from the same d1/d2 (`callGreeks`) |
+| Realized vol | `σ² = Σr² / Σdt`: each return weighted by its real time gap, clamped to [min, max] |
+
+The tests check this against exact references rather than trusting it. `script/gen_vectors.py`
+produces 400 cases with the exact CDF (`math.erfc`, the same function as `scipy.stats.norm.cdf`),
+covering price, delta and all four other Greeks. Every tolerance in the tests is **derived from the
+stated error bound**, not picked. Property fuzzing covers monotonicity in spot, strike and vol,
+no-arbitrage bounds, CDF symmetry, strike-solve round trips, and finite-difference Greeks.
+
+## Security
+
+- **[Security report](docs/security-report.md):** scope, tool runs, triage of every static-analysis
+  finding, the manual checklist, and the findings log.
+- **Design audits:** [before Phase 4](docs/pre-p4-audit.md) (14 fixes) and
+  [after Phase 5](docs/post-p5-audit.md) (6 fixes, including a vault-locking griefing attack).
+- **Exploit tests** for each real finding: oracle manipulation at settlement, cherry-picked rounds,
+  reentrancy through the ERC-1155 hook, ERC-4626 inflation, dust-purchase griefing.
+- **Mutation-checked:** breaking the payout formula, the reentrancy guard, the minimum-fill check or
+  the keeper guard makes the suite fail.
+- **Invariants:** 8 properties run at 256 runs on every push, and 50,000 runs (3.2M calls) nightly.
+- Slither runs on every push (fails on High) and Aderyn runs in CI. Line coverage of `src/` is 100%.
+
+## Trust assumptions
+
+- **Chainlink ETH/USD** reports honestly within its heartbeat. The design removes discretion and
+  same-transaction manipulation, not oracle compromise.
+- **The keeper** can start epochs and take vol snapshots, but only when the contracts say it is
+  due. It cannot choose the strike, the premium or the settlement price, and cannot move funds.
+  Every lifecycle step except `startEpoch` is also permissionless.
+- **The owner** (`Ownable2Step`) can only rotate the vault's keeper. There are no upgrades, no
+  pause and no fee switch.
+
+## Known limitations
+
+- **Model risk.** Realized vol is not implied vol. The vault can sell options too cheaply and lose
+  money in a volatile epoch. The markup is a cushion, not a guarantee.
+- **Whole-balance lock.** All WETH is locked for the epoch even if only part of it sold, above the
+  minimum fill. The unsold part earns nothing.
+- **CDF approximation.** Prices carry the bounded error above; it is stated, not hidden.
+- **Oracle outage.** If the feed was stale at expiry, settlement waits for `fallbackDelay`. It then
+  uses the same deterministic round rather than refusing forever.
+- **USDC.** Premium is paid in USDC, so a depeg or blacklist affects premium claims, not collateral.
+- **Testnet.** The demo profile compresses an epoch to about 7 hours and uses a faucet `TestUSDC`.
+
+## Repository
+
+```
+src/            contracts (+ interfaces/, testnet/TestUSDC.sol)
+test/           unit, fuzz, invariant, exploit and deploy-script tests; vectors/ = reference data
+script/         Deploy.s.sol, gen_vectors.py, keeper-once.sh
+frontend/       Vite + React + viem app (Inter, no wallet-kit), deployable to Vercel
+docs/           security report, design audits, deployment guide, demo script, contest brief
+```
+
+## Running it
+
+```bash
+git clone --recurse-submodules https://github.com/Natgoh88/options-vault.git
+cd options-vault
+forge build && forge test                     # 125+ tests
+FOUNDRY_INVARIANT_RUNS=50000 forge test --match-path test/OptionsVault.invariant.t.sol
 cd frontend && npm install && npm run dev
 ```
 
-## Frontend (Phase 5)
-`frontend/` is a Vite + React + TypeScript app using viem directly (no wallet-kit dependency) and
-the self-hosted Inter variable font. It shows vault TVL, the live Chainlink price and the
-contract's realized vol, the epoch lifecycle, a payoff-at-expiry chart, **live Greeks read from
-`PricingEngine.callGreeks`**, epoch history, and handles deposit, withdraw, buying options,
-redeeming and claiming premium. Deposits and withdrawals are gated by the vault state, with the
-reason and time remaining shown. Deployment steps and the local dev harness are in
-`docs/deployment.md`.
+To deploy to Arbitrum Sepolia, register the keeper, host the frontend, or run everything against
+a local chain, see **[docs/deployment.md](docs/deployment.md)**.
 
-`PricingEngine.callGreeks` returns delta, gamma, vega, theta and rho from the same d1/d2 and CDF as
-the premium. All 400 reference vectors (exact closed forms from Python) plus sign and
-finite-difference property tests pass.
+## Status
 
-## PricingEngine accuracy and limits
-- Normal CDF: Abramowitz & Stegun 26.2.17, absolute error <= 7.5e-8. This propagates to price as
-  roughly (S + K*e^-rT) * 7.5e-8 (about 1.5e-5 at S = 100). Tests derive their tolerances from
-  this bound rather than an arbitrary epsilon.
-- The approximation has a ~1e-9 discontinuity at x = 0 (N(0) is not exactly 0.5); inside the bound.
-- `strikeForDelta` inverts delta by bisecting on d1 (no strike bracket, about 0.5M gas), then
-  recovers the strike in closed form.
-- Realized vol is `sum(r^2) / sum(dt)` over a rolling window using the real gap between snapshots
-  (so a delayed snapshot does not inflate vol), clamped to [`minVolatility`, `maxVolatility`].
-- Reference vectors: `script/gen_vectors.py` writes `test/vectors/bs_vectors.json` (400 cases,
-  exact CDF via `math.erfc`, identical to `scipy.stats.norm.cdf`).
+| Phase | |
+|---|---|
+| 0 Setup | ✓ repo, interfaces first, CI |
+| 1 Pricing engine | ✓ Black-Scholes, CDF, vol, Greeks, 400 reference vectors |
+| 2 Vault + token | ✓ ERC-4626 / ERC-1155, invariants |
+| 3 Oracle + settlement | ✓ deterministic expiry round, Automation keeper |
+| 4 Security pass | ✓ Slither, Aderyn, exploit tests, report |
+| 5 Frontend + deploy | ✓ app, deploy script; the testnet broadcast and Vercel publish need the deployer's wallet |
+| 6 Polish | ✓ docs, audit report, [demo script](docs/demo-script.md), [contest brief](docs/contest-brief.md) |
 
-## Vault design notes (Phase 2)
-- **Epoch flow:** `startEpoch` (keeper) -> `buyOptions` (anyone, USDC) -> `activate` (permissionless
-  once sold out or the writing window closes) -> `beginSettlement` (after expiry) -> `settle`.
-- **Strike and premium are fixed at `startEpoch`** from spot, realized vol and the 30-delta target,
-  so buyers cannot game them during the writing window. Premium rounds up (favours the vault).
-- **Deposits/withdrawals only in Idle**, so collateral cannot move mid-epoch. Idle lasts at least
-  `idleWindow` after every epoch, so depositors always get an exit window.
-- **Stale-quote guard:** `buyOptions` reverts if spot has moved more than `maxSpotDeviationBps` from
-  the epoch-start spot. **Premium markup** (`premiumMarkupBps`) adds a cushion over fair value.
-- **Unsold epochs are skipped:** if nothing is bought, the vault returns to Idle with no lock-up.
-- **Premium is USDC, share price is WETH.** USDC premium streams to shareholders via a per-share
-  accumulator (settled on every mint/burn/transfer), so it is not mixed into `totalAssets`.
-- **Cash-settled in WETH:** payout per option = (S - K) / S, rounded down. `settle` reserves the
-  total (`reservedPayout`, excluded from `totalAssets`); holders call `redeemOptions` to claim. Payout per
-  option is always < 1 WETH, so payouts can never exceed locked collateral.
-- **Virtual-share offset (3)** on the ERC-4626 to blunt first-depositor inflation attacks.
-
-### Invariants (test/OptionsVault.invariant.t.sol)
-Reserved payout backed by WETH balance; options sold <= collateral locked; per-epoch payouts <=
-locked collateral; payout per option < 1; reserved payout covers all outstanding options; USDC
-balance covers all claimable premium; share supply conserved. A mutation check (doubling the payout
-formula) confirms the suite fails on a real accounting bug.
-
-## Oracle, settlement and keeper (Phase 3)
-- **Live spot** (`SettlementResolver.spot`): rejects non-positive answers, `answeredInRound < roundId`,
-  future timestamps, and data older than `heartbeat + buffer`. An optional Arbitrum sequencer-uptime
-  feed adds a down / grace-period check (disabled with `address(0)` on testnets).
-- **Settlement price is not a spot read at trigger time.** It is the Chainlink round in effect at
-  expiry: the last round with `updatedAt <= expiry`. Anyone may call `submitExpiryRound(epoch, roundId)`
-  but only that one round is accepted, so the caller has no discretion and nothing in the settlement
-  transaction can move the price. The feed must also have been fresh at expiry, otherwise settlement
-  is refused rather than run on stale data.
-  Exploit tests: post-expiry feed manipulation, cherry-picking an in-epoch spike, and skipping the
-  price record all fail (`test/Stack.t.sol`).
-- **VaultKeeper** is the single keeper for the engine and vault and is driven by one Chainlink
-  Automation upkeep. `checkUpkeep` finds the next due action (settle, record price, begin settlement,
-  activate, start epoch, hourly snapshot); `performUpkeep` is forwarder-only and re-derives the due
-  action, so forged `performData` is rejected.
-- **Vol floor and cap** (`minVolatility` / `maxVolatility`): found while testing. A flat market gives
-  zero realized vol, `strikeForDelta` rejects that, and the keeper would retry `startEpoch` forever
-  (epoch start frozen). Clamping fixes that and stops one price spike from producing an out-of-range
-  strike. Regression tests cover both ends. Raw vol stays available via `rawVolatility()`.
-
-### Known limitations / trust assumptions
-- Trust the Chainlink ETH/USD feed and its heartbeat/deviation configuration.
-- Chainlink phase changes are handled (successor lookup crosses phase boundaries). If the feed was
-  stale at expiry, settlement is refused until `fallbackDelay` has passed, then the same
-  deterministic round is accepted, so an oracle outage delays settlement but cannot lock funds.
-- The full pre-Phase-4 design audit (14 fixes, accepted risks) is in `docs/pre-p4-audit.md`.
-- Realized vol is sampled from the same feed, so it inherits the feed's update cadence (a stale
-  answer repeated across samples looks like zero vol; the floor covers that).
+Built by two people, from the plan in [`docs/action-plan.md`](docs/action-plan.md). MIT licensed.

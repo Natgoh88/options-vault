@@ -1,7 +1,14 @@
 import { createPublicClient, defineChain, http, type Address, type PublicClient } from "viem";
 import { arbitrumSepolia } from "viem/chains";
 import prod from "./deployments.json";
-import local from "./deployments.local.json";
+
+// The local anvil deployment is gitignored and only exists after `npm run sync` on a dev machine.
+// A glob import tolerates the file being absent (fresh clones, Vercel), and it is only read in
+// dev builds so throwaway local addresses can never ship to production.
+const localFiles = import.meta.env.DEV
+  ? import.meta.glob<Record<string, unknown>>("./deployments.local.json", { eager: true, import: "default" })
+  : {};
+const local = Object.values(localFiles)[0] ?? {};
 
 const LOCAL_ID = 31337;
 const wanted = Number(import.meta.env.VITE_CHAIN_ID ?? arbitrumSepolia.id);

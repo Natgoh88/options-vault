@@ -16,6 +16,8 @@ contract VaultHandler is Test {
     mapping(uint256 => uint256) public paidOut; // epoch => WETH paid to option holders
     uint256 public premiumIn; // USDC paid by buyers
     uint256 public premiumClaimed; // USDC claimed by shareholders
+    mapping(uint256 => uint256) public refunded; // epoch => USDC refunded (cancelled epochs)
+    uint256 public refundedTotal;
     uint256 public epochsStarted;
 
     constructor(VaultBase.Deployment memory d_) {
@@ -126,7 +128,13 @@ contract VaultHandler is Test {
         uint256 amt = bal * bound(pct, 1, 100) / 100;
         if (amt == 0) return;
         vm.prank(a);
-        paidOut[epoch] += d.vault.redeemOptions(epoch, amt);
+        uint256 out = d.vault.redeemOptions(epoch, amt);
+        if (e.cancelled) {
+            refunded[epoch] += out;
+            refundedTotal += out;
+        } else {
+            paidOut[epoch] += out;
+        }
     }
 
     function claimPremium(uint256 seed) external {
@@ -205,14 +213,46 @@ contract OptionsVaultInvariants is VaultBase {
         assertGe(vault.reservedPayout(), owed);
     }
 
-    /// USDC held by the vault always covers all claimable premium.
+    /// USDC held by the vault always covers all claimable premium plus every refund still owed on
+    /// cancelled epochs, and nothing is ever paid out twice (claimed + pending + refunded <= in).
     function invariant_premiumSolvent() public view {
         uint256 pending;
         for (uint256 a; a < handler.actorCount(); ++a) {
             pending += vault.pendingPremium(handler.actors(a));
         }
-        assertGe(usdc.balanceOf(address(vault)), pending);
-        assertLe(handler.premiumClaimed() + pending, handler.premiumIn());
+        uint256 refundsOwed;
+        uint256 n = vault.currentEpoch();
+        for (uint256 i = 1; i <= n; ++i) {
+            IOptionsVault.Epoch memory e = vault.epochData(i);
+            if (!e.cancelled) continue;
+            uint256 id = token.tokenId(e.strike, e.expiry);
+            for (uint256 a; a < handler.actorCount(); ++a) {
+                refundsOwed += Math.mulDiv(
+                    token.balanceOf(handler.actors(a), id), e.premiumPerOption, 1e18
+                );
+            }
+        }
+        assertGe(usdc.balanceOf(address(vault)), pending + refundsOwed, "usdc insolvent");
+        assertLe(
+            handler.premiumClaimed() + pending + handler.refundedTotal(),
+            handler.premiumIn(),
+            "usdc paid out twice"
+        );
+    }
+
+    /// A cancelled epoch never locks or pays WETH, and refunds never exceed what it collected.
+    function invariant_cancelledEpochsAreInert() public view {
+        uint256 n = vault.currentEpoch();
+        for (uint256 i = 1; i <= n; ++i) {
+            IOptionsVault.Epoch memory e = vault.epochData(i);
+            if (!e.cancelled) continue;
+            assertTrue(e.settled);
+            assertEq(e.payoutPerOption, 0);
+            assertEq(handler.paidOut(i), 0);
+            assertLe(handler.refunded(i), e.premiumCollected, "refund > collected");
+            // only under-filled epochs may be cancelled
+            assertLt(e.optionsSold * 10_000, e.collateralLocked * vault.minFillBps() + 1);
+        }
     }
 
     /// Share supply equals the sum of actor balances.

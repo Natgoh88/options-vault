@@ -26,6 +26,7 @@ interface IOptionsVault {
         uint256 settlementPrice; // USD per WETH, 1e18
         uint256 payoutPerOption; // WETH (1e18) per 1e18 options
         bool settled;
+        bool cancelled; // sold below the minimum fill: premium refundable, no collateral locked
     }
 
     error WrongState(State current);
@@ -49,11 +50,14 @@ interface IOptionsVault {
         uint256 indexed epoch, address indexed buyer, uint256 amount, uint256 premium
     );
     event EpochActivated(uint256 indexed epoch, uint256 optionsSold, uint256 premiumCollected);
-    event EpochSkipped(uint256 indexed epoch);
+    event EpochCancelled(uint256 indexed epoch, uint256 optionsSold, uint256 premiumRefundable);
     event SettlementStarted(uint256 indexed epoch, uint256 settlementPrice);
     event EpochSettled(uint256 indexed epoch, uint256 payoutPerOption, uint256 totalPayout);
     event OptionsRedeemed(
         uint256 indexed epoch, address indexed holder, uint256 amount, uint256 payout
+    );
+    event PremiumRefunded(
+        uint256 indexed epoch, address indexed holder, uint256 amount, uint256 refund
     );
     event PremiumClaimed(address indexed account, uint256 amount);
 
@@ -73,8 +77,9 @@ interface IOptionsVault {
     ///         moved more than the allowed deviation from the epoch-start spot (stale quote).
     function buyOptions(uint256 amount) external returns (uint256 premium);
 
-    /// @notice Writing -> Active once sold out or the writing window has closed. If nothing was
-    ///         sold the epoch is skipped and the vault returns straight to Idle (no lock-up).
+    /// @notice Writing -> Active once sold out or the writing window has closed. If less than
+    ///         `minFillBps` of the collateral was sold the epoch is cancelled instead: the vault
+    ///         returns straight to Idle (no lock-up) and buyers can reclaim their premium.
     function activate() external;
 
     /// @notice Active -> Settling: read the recorded settlement price after expiry.
@@ -83,7 +88,8 @@ interface IOptionsVault {
     /// @notice Settling -> Idle: fix payout per option and reserve the WETH for holders.
     function settle() external;
 
-    /// @notice Burn `amount` options of a settled epoch and receive the WETH payout.
+    /// @notice Burn `amount` options of a settled epoch and receive the WETH payout, or, for a
+    ///         cancelled epoch, the USDC premium paid for them.
     function redeemOptions(uint256 epoch, uint256 amount) external returns (uint256 payout);
 
     /// @notice Claim accrued USDC premium.

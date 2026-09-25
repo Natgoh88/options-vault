@@ -149,4 +149,15 @@ contract StackEdgeCases is StackBase {
         vm.expectRevert(VaultKeeper.NotForwarder.selector);
         kc.performUpkeep(pd);
     }
+
+    /// A-3: a WETH donation to a vault with no shareholders made the keeper propose StartEpoch,
+    /// which reverts (NothingToLock), every block. It must just keep taking snapshots.
+    function test_keeperIgnoresDonationWithNoShareholders() public {
+        weth.mint(address(vault), 1e18);
+        for (uint256 i; i < 12; ++i) {
+            _tick();
+        }
+        assertEq(vault.currentEpoch(), 0);
+        assertGe(engine.sampleCount(), 6);
+    }
 }

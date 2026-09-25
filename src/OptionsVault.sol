@@ -42,6 +42,10 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
     uint256 public immutable maxSpotDeviationBps;
     /// @notice Safety margin over the Black-Scholes price, covering model error and adverse selection.
     uint256 public immutable premiumMarkupBps;
+    /// @notice Minimum share of the collateral that must sell for an epoch to go ahead. Below it the
+    ///         epoch is cancelled and premium refunded, so a dust purchase cannot lock the whole
+    ///         vault for an epoch that earns nothing.
+    uint256 public immutable minFillBps;
 
     address public keeper;
 
@@ -75,6 +79,7 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         uint256 targetDelta;
         uint256 maxSpotDeviationBps;
         uint256 premiumMarkupBps;
+        uint256 minFillBps;
     }
 
     constructor(
@@ -94,6 +99,10 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         if (IERC20Metadata(address(usdc_)).decimals() != 6) revert InvalidParams();
         if (p.targetDelta == 0 || p.targetDelta >= 1e18) revert InvalidParams();
         if (p.epochDuration == 0 || p.writingWindow >= p.epochDuration) revert InvalidParams();
+        // idleWindow > 0 keeps expiries strictly increasing, so option token ids (strike, expiry)
+        // can never collide between a cancelled epoch and the next one
+        if (p.idleWindow == 0) revert InvalidParams();
+        if (p.minFillBps > BPS) revert InvalidParams();
         if (p.maxSpotDeviationBps == 0 || p.maxSpotDeviationBps > BPS) revert InvalidParams();
         if (p.premiumMarkupBps > MAX_MARKUP_BPS) revert InvalidParams();
 
@@ -108,6 +117,7 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         targetDelta = p.targetDelta;
         maxSpotDeviationBps = p.maxSpotDeviationBps;
         premiumMarkupBps = p.premiumMarkupBps;
+        minFillBps = p.minFillBps;
         idleSince = block.timestamp;
         emit KeeperSet(keeper_);
     }
@@ -217,12 +227,14 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         if (e.optionsSold < e.collateralLocked && block.timestamp <= e.writingEnd) {
             revert WritingStillOpen();
         }
-        if (e.optionsSold == 0) {
-            // Nothing sold: do not lock depositors for a week. Skip straight back to Idle.
+        if (e.optionsSold == 0 || e.optionsSold * BPS < e.collateralLocked * minFillBps) {
+            // Under-filled: do not lock depositors for an epoch that earns (almost) nothing. The
+            // collected premium is never credited to shareholders; buyers reclaim it instead.
             e.settled = true;
+            e.cancelled = true;
             state = State.Idle;
             idleSince = block.timestamp;
-            emit EpochSkipped(currentEpoch);
+            emit EpochCancelled(currentEpoch, e.optionsSold, e.premiumCollected);
             return;
         }
         state = State.Active;
@@ -265,6 +277,15 @@ contract OptionsVault is ERC4626, Ownable2Step, ReentrancyGuard, IOptionsVault {
         Epoch storage e = _epochs[epoch];
         if (!e.settled) revert NotSettled();
         if (amount == 0) revert ZeroAmount();
+        if (e.cancelled) {
+            // Refund rounds down while each purchase rounded up, so refunds never exceed what was
+            // collected for the epoch.
+            payout = Math.mulDiv(amount, e.premiumPerOption, 1e18);
+            optionToken.burn(msg.sender, e.strike, e.expiry, amount);
+            if (payout > 0) usdc.safeTransfer(msg.sender, payout);
+            emit PremiumRefunded(epoch, msg.sender, amount, payout);
+            return payout;
+        }
         payout = Math.mulDiv(amount, e.payoutPerOption, 1e18); // rounds down
         // effects before interactions (checks-effects-interactions)
         reservedPayout -= payout;

@@ -40,6 +40,7 @@ abstract contract StackBase is Test {
     uint256 constant WRITING = 1 hours;
     uint256 constant IDLE = 2 hours;
     uint256 constant FALLBACK = 2 days;
+    uint256 constant MIN_FILL_BPS = 1000;
 
     int256 px = 2000e8; // feed decimals = 8
     bool up;
@@ -76,7 +77,8 @@ abstract contract StackBase is Test {
                 idleWindow: IDLE,
                 targetDelta: 0.3e18,
                 maxSpotDeviationBps: 100,
-                premiumMarkupBps: 200
+                premiumMarkupBps: 200,
+                minFillBps: MIN_FILL_BPS
             })
         );
         token.setVault(address(vault));
@@ -343,18 +345,43 @@ contract VaultKeeperTest is StackBase {
         kc.performUpkeep(data);
     }
 
-    function test_forgedPerformDataRejected() public {
+    /// performData is ignored: forged data cannot select an action, only what is due runs.
+    function test_forgedPerformDataIgnored() public {
         _deposit(alice, 10e18);
-        // nothing but a snapshot may be due; try to force an epoch start / settlement
+        vm.warp(block.timestamp + 1 hours);
+        feed.push(px);
+        uint256 before = engine.lastTimestamp();
+        // only a snapshot is due; ask for an epoch start / settlement instead
         vm.prank(forwarder);
-        vm.expectRevert(VaultKeeper.NotNeeded.selector);
         kc.performUpkeep(abi.encode(VaultKeeper.Action.StartEpoch, bytes("")));
+        assertEq(vault.currentEpoch(), 0, "forged StartEpoch must not start an epoch");
+        assertGt(engine.lastTimestamp(), before, "the due snapshot ran instead");
+
+        // nothing due at all: reverts, so Automation never pays for a no-op
         vm.prank(forwarder);
         vm.expectRevert(VaultKeeper.NotNeeded.selector);
         kc.performUpkeep(abi.encode(VaultKeeper.Action.Settle, bytes("")));
+    }
+
+    /// A-4: Automation simulates in one block and executes in a later one. An upkeep simulated as
+    /// "snapshot" just before the writing window closes lands after it; it must still succeed and
+    /// run what is due now (Activate) instead of reverting.
+    function test_staleSimulationAcrossBoundaryStillPerforms() public {
+        _deposit(alice, 10e18);
+        _tickUntil(IOptionsVault.State.Writing);
+        _buy(buyer, 5e18);
+        IOptionsVault.Epoch memory e = vault.epochData(1);
+        vm.warp(e.writingEnd); // not yet closed
+        feed.push(px);
+        vm.warp(engine.lastTimestamp() + engine.sampleInterval()); // make a snapshot due
+        if (block.timestamp > e.writingEnd) vm.warp(e.writingEnd);
+        (bool need, bytes memory simulated) = kc.checkUpkeep("");
+        assertTrue(need);
+
+        vm.warp(e.writingEnd + 1); // executed one block later: window has closed
         vm.prank(forwarder);
-        vm.expectRevert(VaultKeeper.NotNeeded.selector);
-        kc.performUpkeep(abi.encode(VaultKeeper.Action.None, bytes("")));
+        kc.performUpkeep(simulated);
+        assertEq(uint8(vault.state()), uint8(IOptionsVault.State.Active));
     }
 
     function test_initAndForwarderOnlyOwner() public {

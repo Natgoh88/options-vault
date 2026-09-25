@@ -137,7 +137,8 @@ contract Deploy is Script {
                 idleWindow: 1 days,
                 targetDelta: 0.3e18,
                 maxSpotDeviationBps: 100,
-                premiumMarkupBps: 200
+                premiumMarkupBps: 200,
+                minFillBps: 1000
             });
         } else {
             // "demo": everything compressed so a full epoch completes in ~7 hours. The Sepolia
@@ -154,7 +155,8 @@ contract Deploy is Script {
                 idleWindow: 30 minutes,
                 targetDelta: 0.3e18,
                 maxSpotDeviationBps: 300,
-                premiumMarkupBps: 200
+                premiumMarkupBps: 200,
+                minFillBps: 1000
             });
         }
     }

@@ -229,7 +229,7 @@ contract SecurityTest is VaultBase {
         priceMul = bound(priceMul, 101, 500); // price = strike * 1.01 .. 5x
         _deposit(alice, 10e18);
         _start();
-        amount = bound(amount, 1, 10e18);
+        amount = bound(amount, 1e18, 10e18); // >= the 10% minimum fill so the epoch goes ahead
         _buy(buyer, amount);
         uint256 strike = vault.epochData(1).strike;
         _finish(strike * priceMul / 100);

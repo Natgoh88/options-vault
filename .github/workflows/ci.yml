@@ -30,3 +30,41 @@ jobs:
       # Fails the build on High-impact findings. Lower-severity findings are triaged in
       # docs/security-report.md; slither.config.json holds the path filters.
       - run: slither . --fail-high
+
+  aderyn:
+    # Aderyn ships Linux/macOS binaries only, so it runs here rather than on dev machines.
+    # The report is uploaded as an artifact and triaged in docs/security-report.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @cyfrin/aderyn
+      - run: aderyn --version
+      - run: aderyn . --src src --path-excludes src/testnet --output aderyn-report.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aderyn-report
+          path: aderyn-report.md
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      # Type-check + production build, exactly what Vercel runs. Catches a UI that would not deploy.
+      - run: npm run build
+      # The local anvil signer key must never end up in a production bundle.
+      - run: "! grep -rl 'VITE_DEV_PRIVATE_KEY\\|ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' dist/"

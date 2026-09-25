@@ -5,6 +5,7 @@
 //   anvil --port 8545 --chain-id 31337                              (terminal 1)
 //   node scripts/dev-seed.mjs [--epochs 3] [--until active|writing|idle]   (terminal 2)
 //   node scripts/dev-seed.mjs --attach --until idle|writing|active  (later: step an existing chain)
+//   add --nobuy to leave the writing window empty for manual purchases from the UI
 //   VITE_CHAIN_ID=31337 npm run dev
 //
 // Uses anvil's public, well-known test keys. Never point this at a real network.
@@ -200,7 +201,7 @@ while (steps++ < 4000) {
   const s2 = await state();
   const id2 = await epoch();
 
-  if (s2 === 1 && bought !== id2) {
+  if (s2 === 1 && bought !== id2 && args.nobuy !== "true") {
     // sell most of the epoch, leaving some unsold so the "sold" bar is not full
     await buyOptions(id2 === 3 ? 0.55 : 0.85);
     bought = id2;

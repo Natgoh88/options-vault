@@ -104,6 +104,10 @@ export function EpochPanel({ snap, now }: { snap?: Snapshot; now: number }) {
             <div className="v num">{live ? `${fmtNum(soldPct * 100, 0)}%` : "—"}</div>
             <div className="bar" aria-hidden="true">
               <i style={{ width: `${soldPct * 100}%` }} />
+              {snap.minFillBps > 0 && <b style={{ left: `${snap.minFillBps / 100}%` }} title="Minimum fill" />}
+            </div>
+            <div className="s num">
+              {live ? `${fmtNum(snap.minFillBps / 100, 0)}% needed or the epoch is cancelled` : `min fill ${fmtNum(snap.minFillBps / 100, 0)}%`}
             </div>
           </div>
           <div>

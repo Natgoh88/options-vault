@@ -19,8 +19,10 @@ interface AutomationCompatibleInterface {
 /// @notice Single keeper for the whole system. It is the `keeper` on PricingEngine and
 ///         OptionsVault, and is driven by one Chainlink Automation upkeep that does two jobs:
 ///         hourly price snapshots for the volatility window, and the epoch lifecycle.
-/// @dev `checkUpkeep` runs off-chain (simulated); `performUpkeep` re-validates every condition so
-///      a forged `performData` can at worst trigger an action that was legitimately due.
+/// @dev `checkUpkeep` runs off-chain (simulated) and `performUpkeep` lands in a later block, so what
+///      is due can change in between (e.g. the writing window closes). `performUpkeep` therefore
+///      ignores `performData` and executes whatever is due at execution time: stale simulations still
+///      succeed, and forged data cannot select an action.
 ///      If a lifecycle action unexpectedly reverts, a due snapshot is still recorded so the
 ///      volatility window never starves; if no snapshot is due the whole call reverts, which keeps
 ///      Automation from burning gas on a no-op every block.
@@ -98,14 +100,11 @@ contract VaultKeeper is AutomationCompatibleInterface {
         return (a != Action.None, abi.encode(a, data));
     }
 
-    function performUpkeep(bytes calldata performData) external {
+    function performUpkeep(bytes calldata) external {
         if (msg.sender != forwarder) revert NotForwarder();
-        (Action a, bytes memory data) = abi.decode(performData, (Action, bytes));
-        // Re-derive what is due right now and require the request to match it.
-        (Action due, bytes memory dueData) = _nextAction();
-        if (a == Action.None || a != due || keccak256(data) != keccak256(dueData)) {
-            revert NotNeeded();
-        }
+        // Re-derive what is due right now; the simulated performData may be a block out of date.
+        (Action a, bytes memory data) = _nextAction();
+        if (a == Action.None) revert NotNeeded();
 
         try this.execute(a, data) {
             emit Performed(a);
@@ -171,6 +170,7 @@ contract VaultKeeper is AutomationCompatibleInterface {
             if (
                 block.timestamp >= vault.idleSince() + vault.idleWindow()
                     && IERC4626(address(vault)).totalAssets() > 0
+                    && IERC4626(address(vault)).totalSupply() > 0
                     && engine.sampleCount() >= minSamples && !_snapshotDue() && _spotOk()
             ) {
                 return (Action.StartEpoch, "");
