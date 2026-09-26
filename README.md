@@ -14,6 +14,10 @@ realized vol. No off-chain quote, no market maker and no admin sets the price.
 
 [![CI](https://github.com/Natgoh88/options-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/Natgoh88/options-vault/actions/workflows/ci.yml)
 
+![Options Vault app: live epoch with on-chain strike, premium and lifecycle](docs/images/01-overview.png)
+
+<sub>Local test run with the real contracts and keeper. More: [payoff chart](docs/images/02-payoff-chart.png), [on-chain Greeks](docs/images/03-greeks.png), [epoch history](docs/images/04-epoch-history.png).</sub>
+
 ## Why this is not just Dopex
 
 Dopex SSOVs use the same covered-call shape, and they work. The difference is where the price comes
